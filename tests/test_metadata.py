@@ -362,6 +362,21 @@ class TestExifGenerator:
         path = _img_with_software(tmp_path, "jpg", "Adobe Photoshop 25.0")
         assert exif_generator(path) is None
 
+    def test_make_tag_ai_tool_detected(self, tmp_path: Path):
+        # Ideogram tags its output with EXIF Make="Ideogram AI" (verified on a
+        # real download), so the Make tag must be read too.
+        exif = piexif.dump({"0th": {piexif.ImageIFD.Make: b"Ideogram AI"}, "Exif": {}, "GPS": {}, "1st": {}})
+        path = tmp_path / "ideogram.jpg"
+        Image.new("RGB", (64, 64)).save(path, exif=exif)
+        assert exif_generator(path) == "Ideogram AI"
+
+    def test_camera_make_not_flagged(self, tmp_path: Path):
+        # A real camera Make ("Apple") carries no AI token -> not flagged.
+        exif = piexif.dump({"0th": {piexif.ImageIFD.Make: b"Apple"}, "Exif": {}, "GPS": {}, "1st": {}})
+        path = tmp_path / "iphone.jpg"
+        Image.new("RGB", (64, 64)).save(path, exif=exif)
+        assert exif_generator(path) is None
+
     def test_xmp_creatortool_scan_covers_unopenable(self, tmp_path: Path):
         # PIL can't open this fake HEIF; the raw XMP CreatorTool scan still works.
         path = tmp_path / "fake.heic"

@@ -207,7 +207,15 @@ def exif_generator(image_path: Path) -> str | None:
             exif_bytes = img.info.get("exif")
         if exif_bytes:
             tags = piexif.load(exif_bytes).get("0th", {})
-            for tag in (piexif.ImageIFD.Software, piexif.ImageIFD.Artist, piexif.ImageIFD.ImageDescription):
+            # Make catches camera-style tags AI tools reuse (Ideogram writes
+            # Make="Ideogram AI"); real cameras put "Apple"/"Canon" there, which
+            # carry no AI token, so this stays low-false-positive.
+            for tag in (
+                piexif.ImageIFD.Software,
+                piexif.ImageIFD.Make,
+                piexif.ImageIFD.Artist,
+                piexif.ImageIFD.ImageDescription,
+            ):
                 value = tags.get(tag)
                 if isinstance(value, bytes):
                     candidates.append(value.decode("latin1", "replace"))
