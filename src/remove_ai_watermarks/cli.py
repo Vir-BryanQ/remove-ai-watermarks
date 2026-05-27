@@ -85,7 +85,9 @@ def _read_bgr_and_alpha(path: Path) -> tuple[np.ndarray | None, np.ndarray | Non
     """
     import cv2
 
-    image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    from remove_ai_watermarks import image_io
+
+    image = image_io.imread(path, cv2.IMREAD_UNCHANGED)
     if image is None:
         return None, None
     if image.ndim == 2:
@@ -109,11 +111,12 @@ def _write_bgr_with_alpha(
     forced to 0 inside that bbox (expanded by ``pad`` px) so the watermark area
     becomes fully transparent in the saved file.
     """
-    import cv2
     import numpy as np
 
+    from remove_ai_watermarks import image_io
+
     if alpha is None or path.suffix.lower() not in _ALPHA_FORMATS:
-        cv2.imwrite(str(path), bgr)
+        image_io.imwrite(path, bgr)
         return
 
     alpha_out = alpha
@@ -127,7 +130,7 @@ def _write_bgr_with_alpha(
             alpha_out[y0:y1, x0:x1] = 0
 
     bgra = np.dstack([bgr, alpha_out])
-    cv2.imwrite(str(path), bgra)
+    image_io.imwrite(path, bgra)
 
 
 def _run_doubao_if_selected(
@@ -481,7 +484,7 @@ def cmd_invisible(
     if not invisible_available():
         console.print(
             "[red]Error:[/] GPU dependencies not installed.\n"
-            "  Install them with: [bold]pip install 'remove-ai-watermarks[gpu]'[/]"
+            "  Install them with: [bold]pip install 'remove-ai-watermarks\\[gpu]'[/]"
         )
         raise SystemExit(1)
 
@@ -744,7 +747,7 @@ def cmd_all(
         if not invisible_available():
             console.print(
                 "    [yellow]⚠[/] Skipped — GPU dependencies not installed.\n"
-                "    Install them with: [bold]pip install 'remove-ai-watermarks[gpu]'[/]"
+                "    Install them with: [bold]pip install 'remove-ai-watermarks\\[gpu]'[/]"
             )
         else:
             from remove_ai_watermarks.invisible_engine import InvisibleEngine

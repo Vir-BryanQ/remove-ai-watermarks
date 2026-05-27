@@ -217,7 +217,9 @@ class InvisibleEngine:
                 import cv2
                 import numpy as np
 
-                out_cv = cv2.imread(str(out_path), cv2.IMREAD_COLOR)
+                from remove_ai_watermarks import image_io
+
+                out_cv = image_io.imread(out_path, cv2.IMREAD_COLOR)
 
                 if protect_faces and original_faces:
                     if self._progress_callback:
@@ -243,20 +245,22 @@ class InvisibleEngine:
                     # Using INTER_LANCZOS4 for high-quality upscaling back to original
                     out_cv = cv2.resize(out_cv, orig_size, interpolation=cv2.INTER_LANCZOS4)
 
-                cv2.imwrite(str(out_path), out_cv)
+                image_io.imwrite(out_path, out_cv)
 
             else:
                 # Even if no protect_faces or humanize, we must restore original size if needed
                 import cv2
 
-                out_cv = cv2.imread(str(out_path), cv2.IMREAD_COLOR)
+                from remove_ai_watermarks import image_io
+
+                out_cv = image_io.imread(out_path, cv2.IMREAD_COLOR)
                 if out_cv is not None and (out_cv.shape[1], out_cv.shape[0]) != orig_size:
                     if self._progress_callback:
                         self._progress_callback(
                             f"Upscaling result back to original resolution {orig_size[0]}x{orig_size[1]}..."
                         )
                     out_cv = cv2.resize(out_cv, orig_size, interpolation=cv2.INTER_LANCZOS4)
-                    cv2.imwrite(str(out_path), out_cv)
+                    image_io.imwrite(out_path, out_cv)
 
             return out_path
         finally:

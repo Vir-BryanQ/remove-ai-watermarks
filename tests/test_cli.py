@@ -509,3 +509,21 @@ class TestBatchCommand:
         assert result.exit_code == 0
         expected_dir = tmp_path / "input_clean"
         assert expected_dir.exists()
+
+
+class TestGpuHintMarkup:
+    """The GPU-extra install hint must survive rich markup (the ``[gpu]`` token
+    is otherwise parsed as a style tag and silently dropped)."""
+
+    def test_invisible_install_hint_keeps_gpu_extra(self, runner, sample_png):
+        with patch("remove_ai_watermarks.invisible_engine.is_available", return_value=False):
+            result = runner.invoke(main, ["invisible", str(sample_png)])
+        assert result.exit_code != 0
+        assert "remove-ai-watermarks[gpu]" in result.output
+
+    def test_all_install_hint_keeps_gpu_extra(self, runner, sample_png):
+        # The `all` pipeline skips the invisible step with a warning that carries
+        # the same hint; it must keep the [gpu] extra too.
+        with patch("remove_ai_watermarks.invisible_engine.is_available", return_value=False):
+            result = runner.invoke(main, ["all", str(sample_png)])
+        assert "remove-ai-watermarks[gpu]" in result.output

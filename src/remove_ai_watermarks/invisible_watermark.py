@@ -78,10 +78,11 @@ def detect_invisible_watermark(image_path: Path) -> str | None:
     """
     if not is_available():
         return None
-    import cv2
     from imwatermark import WatermarkDecoder
 
-    img = cv2.imread(str(image_path))
+    from remove_ai_watermarks import image_io
+
+    img = image_io.imread(image_path)
     if img is None:
         return None
 

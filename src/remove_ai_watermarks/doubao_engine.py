@@ -239,7 +239,9 @@ class DoubaoEngine:
 
 def load_image_bgr(path: str | Path) -> NDArray:
     """Read an image as BGR ndarray (helper for scripts/tests)."""
-    img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    from remove_ai_watermarks import image_io
+
+    img = image_io.imread(path, cv2.IMREAD_COLOR)
     if img is None:
         raise FileNotFoundError(f"Failed to read image: {path}")
     return img

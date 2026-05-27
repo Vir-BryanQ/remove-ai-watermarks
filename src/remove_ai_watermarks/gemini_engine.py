@@ -556,7 +556,9 @@ def detect_sparkle_confidence(image_path: Path) -> float | None:
     (cv2 returns None for unsupported containers such as HEIC). Kept here so the
     cv2 dependency stays in this module; callers apply their own threshold.
     """
-    img = cv2.imread(str(image_path))
+    from remove_ai_watermarks import image_io
+
+    img = image_io.imread(image_path)
     if img is None:
         return None
     return float(GeminiEngine().detect_watermark(img).confidence)
