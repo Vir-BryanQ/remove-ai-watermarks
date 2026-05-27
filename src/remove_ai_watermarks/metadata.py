@@ -90,10 +90,10 @@ IPTC_AI_FIELD_MARKERS: tuple[bytes, ...] = (
 # (``ftyp``) is also accepted, so this is a fast-path hint, not the sole gate.
 _ISOBMFF_EXTS: frozenset[str] = frozenset({".avif", ".heif", ".heic", ".jxl", ".mp4", ".mov", ".m4v", ".m4a"})
 
-# Non-ISOBMFF audio/video we can DETECT (binary scan) but not strip at the
-# container level (EBML / framed / RIFF need re-encoding). remove_ai_metadata
-# fails clearly on these rather than crashing in the image path.
-_UNSUPPORTED_CONTAINER_EXTS: frozenset[str] = frozenset(
+# Non-ISOBMFF audio/video the ISOBMFF box walker can't reach (EBML / framed /
+# RIFF / Vorbis). remove_ai_metadata strips their container metadata losslessly
+# via ffmpeg (`-c copy`), so it needs ffmpeg on PATH for these.
+_FFMPEG_STRIP_EXTS: frozenset[str] = frozenset(
     {".webm", ".mkv", ".mka", ".mp3", ".wav", ".flac", ".ogg", ".oga", ".opus", ".aac"}
 )
 
@@ -487,6 +487,39 @@ def get_ai_metadata(image_path: Path) -> dict[str, str]:
     return result
 
 
+def _strip_with_ffmpeg(source_path: Path, output_path: Path) -> Path:
+    """Strip container metadata from a non-ISOBMFF audio/video file via ffmpeg.
+
+    Uses a lossless stream copy (``-c copy``), so codec data is untouched and only
+    container-level tags/chapters are dropped -- the metadata strip for WebM /
+    Matroska (EBML), MP3 (ID3), WAV / FLAC / OGG (RIFF / Vorbis comments) that the
+    ISOBMFF box walker cannot reach. Requires ffmpeg on PATH (raises if absent).
+    The output extension should match the source so ``-c copy`` can re-mux.
+    """
+    import shutil
+    import subprocess
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError(
+            f"ffmpeg is required to strip metadata from {source_path.suffix} files but was not found on "
+            "PATH; install ffmpeg (e.g. `brew install ffmpeg`) or re-encode the file with another tool"
+        )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ffmpeg, "-y", "-loglevel", "error",
+        "-i", str(source_path),
+        "-map_metadata", "-1", "-map_chapters", "-1",
+        "-c", "copy",
+        str(output_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)  # noqa: S603
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed to strip metadata from {source_path}: {result.stderr.strip()[:300]}")
+    logger.info("Stripped container metadata via ffmpeg -> %s", output_path)
+    return output_path
+
+
 def remove_ai_metadata(
     source_path: Path,
     output_path: Path | None = None,
@@ -530,15 +563,11 @@ def remove_ai_metadata(
         logger.info("Stripped %d AI-provenance box(es) → %s", stripped, output_path)
         return output_path
 
-    # Containers we can detect (via identify's byte scan) but cannot strip at the
-    # container level: non-ISOBMFF audio/video (Matroska/WebM are EBML; MP3 is
-    # framed; WAV is RIFF). Re-encoding them is out of scope, so fail clearly
-    # rather than crash in the PIL image path below.
-    if source_path.suffix.lower() in _UNSUPPORTED_CONTAINER_EXTS:
-        raise ValueError(
-            f"container-level metadata removal is not supported for {source_path.suffix} "
-            "(detection via `identify` still works); re-encode it with a media tool to strip metadata"
-        )
+    # Non-ISOBMFF audio/video (WebM/Matroska EBML, MP3 ID3, WAV/FLAC/OGG): the
+    # box walker can't reach these, so strip container metadata losslessly via
+    # ffmpeg (-c copy -- codec data untouched, only tags/chapters dropped).
+    if source_path.suffix.lower() in _FFMPEG_STRIP_EXTS:
+        return _strip_with_ffmpeg(source_path, output_path)
 
     # Read image and filter metadata
     with Image.open(source_path) as img:

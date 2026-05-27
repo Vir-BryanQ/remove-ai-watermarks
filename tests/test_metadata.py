@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 from pathlib import Path
 
 import piexif
@@ -699,9 +701,35 @@ class TestIsobmffMetadataRemoval:
         remove_ai_metadata(src, out)
         assert out.read_bytes() == _MP4_FTYP + _MP4_MDAT
 
-    def test_unsupported_container_raises(self, tmp_path: Path):
+    def test_unparseable_audio_raises(self, tmp_path: Path):
+        # Garbage that ffmpeg can't parse must raise a clear error, not crash in
+        # the image path. (When ffmpeg is absent this still raises RuntimeError.)
         src = tmp_path / "audio.mp3"
-        src.write_bytes(b"ID3\x04\x00\x00\x00\x00\x00\x00 fake mp3 frames")
+        src.write_bytes(b"ID3\x04\x00\x00\x00\x00\x00\x00 not real mp3 frames")
         out = tmp_path / "out.mp3"
-        with pytest.raises(ValueError, match="not supported"):
+        with pytest.raises(RuntimeError):
             remove_ai_metadata(src, out)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+class TestFfmpegMetadataStrip:
+    """Lossless container-metadata strip for non-ISOBMFF audio/video via ffmpeg."""
+
+    def _wav_with_tag(self, path: Path, tag: str = "Suno AI") -> None:
+        subprocess.run(  # noqa: S603
+            [
+                shutil.which("ffmpeg"), "-y", "-loglevel", "error",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=0.1",
+                "-metadata", f"title={tag}", str(path),
+            ],
+            check=True,
+        )
+
+    def test_strips_wav_title_metadata(self, tmp_path: Path):
+        src = tmp_path / "in.wav"
+        self._wav_with_tag(src, "Suno AI generated")
+        assert b"Suno AI generated" in src.read_bytes()  # tag is present pre-strip
+        out = tmp_path / "clean.wav"
+        remove_ai_metadata(src, out)
+        assert out.exists()
+        assert b"Suno AI generated" not in out.read_bytes()  # tag stripped, audio kept
