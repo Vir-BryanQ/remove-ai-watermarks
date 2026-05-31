@@ -116,7 +116,7 @@ image → encode to latent space (VAE) at native resolution
 
 > **Default strength is `0.30`, tuned to remove the current Google SynthID.** An oracle-verified study (fresh Gemini images, "Verify with SynthID") found the current SynthID survives `0.10`/`0.15`/`0.20` and clears only at `0.30`. SynthID is a moving target (the threshold has climbed `0.05` → `0.10` → `~0.30` as Google hardens it), and there is no local SynthID detector, so the tool cannot self-check and auto-tune. If the oracle still reads SynthID, raise `--strength` further; if you care more about preserving fine text, lower it. `0.30` softens dense typography somewhat, so use the lowest value that comes back clean on the oracle.
 >
-> **For SynthID in text, also pass `--no-protect-text`.** Text protection preserves text regions, but SynthID hides in them, so on text-heavy images the watermark can survive inside text at `0.30` unless protection is off. This trades text crispness for full removal — a genuine tradeoff, not a bug.
+> **Keep text protection on (the default) — it does not block SynthID removal.** SynthID is a global watermark, so strength `0.30` clears it whether or not text is protected, and text protection keeps headings and body text readable through the pass (only the very finest print still softens at `0.30`). You do not need to disable it for removal; `--no-protect-text` only trades text quality for a faster run.
 >
 > **OpenAI / ChatGPT images do not carry Google SynthID** (they use C2PA metadata, stripped by the metadata step), so `0.30` is overkill there; `--strength 0.10` preserves quality and the metadata strip is what matters.
 >

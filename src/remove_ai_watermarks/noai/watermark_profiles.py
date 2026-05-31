@@ -18,11 +18,14 @@ CTRLREGEN_MODEL_ID = "yepengliu/ctrlregen"
 # treat this as a moving target and re-test against fresh Gemini output periodically.
 # Cost of 0.3: SSIM ~0.97 vs original (modest), but fine/dense typography softens, and
 # it is OVERKILL for non-SynthID sources (OpenAI/ChatGPT carry C2PA, not Google SynthID
-# -- 0.10 is plenty there). Two known tensions, documented but not auto-handled here:
-# (1) higher strength deforms text more (why text protection runs by default), and
-# (2) `protect_text` SHIELDS the text regions where SynthID hides, so text-region
-# SynthID can survive at 0.3 unless `--no-protect-text` is passed. (Fixed LOW/MEDIUM/
-# HIGH presets were removed -- the one knob is this default + the per-call override.)
+# -- 0.10 is plenty there). protect_text is RECOMMENDED ON for SynthID removal (A/B
+# verified 2026-05-31): SynthID is GLOBAL, so 0.3 clears it whether protection is on or
+# off, and protection salvages medium-text fidelity (~3x runtime); only the very finest
+# text still softens at 0.3. (An earlier comment claimed protect_text shields the
+# watermark -- that was wrong, it mistook the 0.10 strength failure for a protection
+# effect.) The only true tension is the finest typography softening at this aggressive
+# strength. (Fixed LOW/MEDIUM/HIGH presets were removed -- the one knob is this default
+# plus the per-call override.)
 DEFAULT_STRENGTH = 0.30
 
 # CtrlRegen removes watermarks by regenerating from (near) clean Gaussian noise,
