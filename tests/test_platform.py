@@ -13,8 +13,11 @@ import pytest
 from remove_ai_watermarks.noai.progress import is_mps_error
 from remove_ai_watermarks.noai.utils import get_image_format, is_supported_format
 from remove_ai_watermarks.noai.watermark_profiles import (
+    CTRLREGEN_DEFAULT_STRENGTH,
+    DEFAULT_STRENGTH,
     detect_model_profile,
     get_model_id_for_profile,
+    resolve_strength,
 )
 from remove_ai_watermarks.noai.watermark_remover import get_device, is_watermark_removal_available
 
@@ -119,6 +122,29 @@ class TestModelProfiles:
 
     def test_detect_ctrlregen(self):
         assert detect_model_profile("yepengliu/ctrlregen") == "ctrlregen"
+
+
+class TestResolveStrength:
+    """resolve_strength applies the profile default only when strength is unset."""
+
+    def test_none_default_profile_uses_sdxl_default(self):
+        assert resolve_strength(None, "default") == DEFAULT_STRENGTH
+
+    def test_none_ctrlregen_uses_clean_noise_default(self):
+        # ctrlregen must NOT inherit the light SDXL 0.10 (that makes it a no-op);
+        # clean-noise regeneration is the lever against robust marks.
+        assert resolve_strength(None, "ctrlregen") == CTRLREGEN_DEFAULT_STRENGTH
+        assert CTRLREGEN_DEFAULT_STRENGTH > DEFAULT_STRENGTH
+
+    def test_explicit_value_overrides_both_profiles(self):
+        assert resolve_strength(0.3, "default") == 0.3
+        assert resolve_strength(0.3, "ctrlregen") == 0.3
+
+    def test_explicit_zero_is_respected_not_treated_as_unset(self):
+        # 0.0 is falsy but explicit -- must not fall through to the profile default
+        # (the old `strength or DEFAULT` bug would have). Range validation lives in
+        # remove_watermark, not here.
+        assert resolve_strength(0.0, "ctrlregen") == 0.0
 
 
 # ── Format utilities ────────────────────────────────────────────────

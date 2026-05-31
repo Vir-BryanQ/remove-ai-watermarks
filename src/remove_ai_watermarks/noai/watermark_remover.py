@@ -33,6 +33,7 @@ from remove_ai_watermarks.noai.watermark_profiles import (
     DEFAULT_MODEL_ID,
     DEFAULT_STRENGTH,
     detect_model_profile,
+    resolve_strength,
 )
 
 logger = logging.getLogger(__name__)
@@ -474,7 +475,7 @@ class WatermarkRemover:
         if output_path is None:
             output_path = image_path
 
-        strength = strength or self.DEFAULT_STRENGTH
+        strength = resolve_strength(strength, self.model_profile)
 
         if not 0.0 <= strength <= 1.0:
             raise ValueError(f"Strength must be between 0.0 and 1.0, got {strength}")
@@ -894,12 +895,16 @@ class WatermarkRemover:
 def remove_watermark(
     image_path: Path,
     output_path: Path | None = None,
-    strength: float = DEFAULT_STRENGTH,
+    strength: float | None = None,
     model_id: str | None = None,
     device: str | None = None,
     hf_token: str | None = None,
 ) -> Path:
-    """Convenience function to remove watermark from an image."""
+    """Convenience function to remove watermark from an image.
+
+    ``strength=None`` lets the profile pick its default (0.10 for SDXL, clean-noise
+    1.0 for ctrlregen); pass a value to override.
+    """
     remover = WatermarkRemover(model_id=model_id, device=device, hf_token=hf_token)
     return remover.remove_watermark(
         image_path=image_path,
