@@ -255,10 +255,9 @@ def has_ai_metadata(image_path: Path) -> bool:
     """
     from PIL import Image
 
-    # PIL may not handle AVIF/HEIF/JPEG-XL without the optional plugins
-    # (ultralytics also monkey-patches Image.open in a way that can raise
-    # ModuleNotFoundError when pi_heif autoload fails), so any open failure
-    # falls through to the binary scan.
+    # PIL may not handle AVIF/HEIF/JPEG-XL without the optional plugins, and a
+    # third-party plugin autoload can raise a non-OSError (e.g. ModuleNotFoundError),
+    # so any open failure falls through to the binary scan.
     try:
         with Image.open(image_path) as img:
             for key in img.info:
@@ -655,9 +654,9 @@ def get_ai_metadata(image_path: Path) -> dict[str, str]:
 
     result: dict[str, str] = {}
 
-    # PIL may not open AVIF/HEIF/JPEG-XL without optional plugins (and
-    # ultralytics' Image.open patch can raise ModuleNotFoundError); fall through
-    # to the C2PA/binary path on any open failure. See CLAUDE.md.
+    # PIL may not open AVIF/HEIF/JPEG-XL without optional plugins (and a
+    # third-party plugin autoload can raise a non-OSError); fall through to the
+    # C2PA/binary path on any open failure. See CLAUDE.md.
     try:
         with Image.open(image_path) as img:
             for key, value in img.info.items():

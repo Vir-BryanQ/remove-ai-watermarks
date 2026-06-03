@@ -196,12 +196,11 @@ with SynthID" for Google). The test set and per-image results are recorded in
 **CORRECTION (supersedes the earlier "resolution dependence" claim).** A prior
 version of this doc and CLAUDE.md stated that strength 0.30 failed to remove
 SynthID on 1600x1600 gpt-image and that removal was resolution-dependent. That
-was an **artifact of the text-protection bug** (issue #14): those tests ran a
-build where `protect_text` was ON by default, and the high-resolution text
-re-scrub re-introduced SynthID in the dense-text regions of the infographic
-images tested. Re-running the *same* 1600x1600 image on clean v0.8.6 (protect
-OFF) removes SynthID at **0.05**. The "large images resist removal" conclusion
-was false; the resistance was the protect-text shielding, now fixed (v0.8.5).
+was a **measurement artifact of a since-removed per-region re-scrub step** (issue
+#14): on the dense-text infographics tested, that step could reconstitute SynthID
+in text regions. Re-running the *same* 1600x1600 image on the clean current
+pipeline removes SynthID at **0.05**. The "large images resist removal" conclusion
+was false; the resistance was that region-rescrub shielding, since removed.
 
 **Open / not locally testable:**
 
@@ -362,38 +361,37 @@ empirically from oracle tests:
 
 Google has hardened SynthID relative to OpenAI's (vendor gap measured at ~3x
 strength), but the year-over-year "0.05 -> 0.10 -> 0.30" progression above
-conflates a real hardening trend with the now-debunked protect-text artifact;
+conflates a real hardening trend with the now-debunked region-rescrub artifact;
 treat only the section 2.2 controlled numbers as authoritative.
 
 ---
 
 ## 5. Practical implications for this tool
 
-### 5.1 Text and face protection: OFF by default
+### 5.1 Preserving content means regenerating it, never copying it
 
-**Text protection (`--protect-text`) can preserve SynthID in text regions.**
-Verified June 2026 on gpt-image at 1600x1600: same image processed twice --
-with `--protect-text` the oracle detected SynthID; without it, SynthID was
-removed. The mechanism: the global img2img pass clears SynthID everywhere, but
-the text-protection high-resolution re-scrub regenerates those pixels from an
-upscaled crop. At the effective resolution of the upscaled crop, the per-region
-pass may be insufficient to re-destroy the payload, reconstituting SynthID in
-text regions.
+**Core rule:** SynthID is a pixel-amplitude pattern, so any approach that FREEZES
+or RESTORES original pixels in a region re-introduces the watermark there. Early
+region-based text/face "protection" (since removed) proved this: restoring the
+original face pixels guaranteed SynthID survived in faces, and even a per-region
+high-resolution re-scrub from an upscaled crop could be insufficient to destroy
+the payload, reconstituting SynthID in text. The lesson held and shaped the
+current design: **content is preserved by REGENERATING it under structural
+conditioning, never by copying original pixels.**
 
-**Face protection (`--protect-faces`) has an even more direct preservation
-mechanism.** The pipeline extracts face regions from the ORIGINAL (watermarked)
-image BEFORE the diffusion pass, runs the global pass (which removes SynthID
-everywhere), then blends the original face pixels BACK onto the result
-(`invisible_engine.py`: `original_faces = protector.extract_faces(cv_img)`
-before `remove_watermark`, then `protector.restore_faces(out_cv, original_faces)`
-after). Those restored pixels are the original watermarked pixels -- SynthID is
-guaranteed to survive in face regions, not just possibly. The text-protection
-case is at least re-generating (uncertain); face protection is literally
-restoring the original SynthID-bearing pixels.
-
-Both `--protect-text` and `--protect-faces` are therefore **experimental and
-OFF by default**. Enable only when text/face fidelity matters more than
-watermark removal completeness, and always verify the result with the oracle.
+- **Text + structure:** `--pipeline controlnet` (SDXL img2img + a canny ControlNet)
+  conditions the regeneration on the edge map, so text and structure stay sharp
+  while every pixel is still regenerated -- SynthID is removed everywhere. Verified
+  better than plain img2img at the same strength (text stays legible where plain
+  garbles it), and the controlnet background scrub reads clean on the oracle.
+- **Face identity:** canny holds face *structure* but not *identity*. The validated
+  approach (researched + prototyped 2026-06-03, not yet shipped) is a face-restoration
+  post-pass: CodeFormer/GFPGAN RE-SYNTHESIZES each face from a discrete codebook
+  (codebook pixels, not original -> scrubs SynthID) at a low fidelity weight
+  (`w~0.5`), composited into the cleaned image. Oracle-confirmed clean in face
+  regions with identity preserved. (An IP-Adapter FaceID approach was tried and
+  REMOVED -- it needs high denoise strength and corrupts faces at removal strength;
+  see `docs/controlnet-removal-pipeline-research.md`.)
 
 ### 5.2 Strength setting
 
@@ -431,13 +429,13 @@ value that reads clean on the oracle.
   verifier is not the same as being forensically indistinguishable from clean
   content (arXiv:2605.09203).
 
-### 5.4 ctrlregen and img2img: the tradeoff
+### 5.4 Strength vs forensic detectability: the tradeoff
 
-Both the paper and our testing confirm: higher img2img strength removes the
-watermark but introduces detectable regeneration artifacts. The Goonatilake &
-Ateniese paper shows CtrlRegen+ (the most powerful remover) is simultaneously
-the most forensically detectable (AUROC 0.9999). The tradeoff is unavoidable
-with current diffusion-based approaches.
+Higher img2img strength removes the watermark but introduces detectable
+regeneration artifacts. The Goonatilake & Ateniese paper shows the strongest
+diffusion-based removers are simultaneously the most forensically detectable
+(AUROC up to 0.9999). The tradeoff is unavoidable with current diffusion-based
+approaches: defeating the vendor's verifier is not the same as being clean.
 
 ---
 

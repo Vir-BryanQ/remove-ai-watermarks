@@ -23,7 +23,7 @@ If this tool saves you time, consider [sponsoring its development](https://githu
 - **AI metadata stripping** — EXIF, PNG text chunks, C2PA provenance manifests (PNG / JPEG / AVIF / HEIF / JPEG-XL, **MP4 / MOV / M4V / M4A** at the container level, and **WebM / MP3 / WAV / FLAC / OGG** losslessly via ffmpeg), XMP DigitalSourceType
 - **"Made with AI" label removal** — removes the AI-disclosure metadata that platforms read to apply automatic labels (useful for clearing a false-positive label from a human-edited photograph)
 - **Analog Humanizer** — optional film grain and chromatic aberration post-processing
-- **Smart Face Protection** — automatic extraction and blending of human faces to prevent AI distortion
+- **Text and face preservation** — optional `--pipeline controlnet` adds a canny ControlNet that keeps text and face structure sharp through the removal pass (without copying original pixels, so SynthID is still removed). Note: canny preserves face *structure*, not *identity* (the regenerated face drifts in likeness); preserving identity is a separate face-restoration post-pass, researched but not yet shipped
 - **Batch processing** — process entire directories
 - **Detection** — three-stage NCC watermark detection with confidence scoring
 - **Provenance detection (`identify`)** — aggregate C2PA issuer, the C2PA soft-binding forensic-watermark vendor (Adobe TrustMark, Digimarc, Imatag, ...), IPTC "Made with AI" plus the IPTC 2025.1 `AISystemUsed` field, embedded SD/ComfyUI params, EXIF/XMP generator tags, the xAI/Grok EXIF signature, the China TC260 AIGC label (XMP, PNG chunk, or EXIF), the HuggingFace `hf-job-id` job marker, the SynthID metadata proxy, the visible marks (Gemini sparkle plus the Doubao "豆包AI生成" / Jimeng "即梦AI" text marks), the open SD/SDXL/FLUX invisible watermark, and (with the `trustmark` extra) the open Adobe TrustMark watermark into one origin-platform + watermark-inventory verdict (`--json` for machine output)
@@ -117,9 +117,9 @@ image → encode to latent space (VAE) at native resolution
 
 > **Default strength is vendor-adaptive (no flag needed).** The tool reads the C2PA issuer to detect which vendor's SynthID is present and picks the strength that clears it with the least quality loss: **OpenAI gpt-image → `0.10`**, **Google Gemini → `0.15`**, **unknown source → `0.15`**. An oracle-verified June 2026 study (clean pipeline, per-image openai.com/verify or Gemini app) found OpenAI's watermark clears at `0.05` across `1024`-`1600` px (resolution-independent) while Google's is ~3x more robust and needs `0.15`. The dominant factor is the vendor, not resolution. There is no local SynthID detector, so if the oracle still reads SynthID, raise `--strength`; if you care more about preserving fine text, lower it. (Caveat: Google's `0.15` was validated on the capped `--max-resolution 1536` path; a very large native Gemini image may need more.)
 >
-> **Text and face protection are OFF by default.** The high-resolution text re-scrub can shield SynthID in text regions, leaving the watermark intact there even after the global pass clears it everywhere else (verified June 2026: same image, with `--protect-text` → SynthID detected; without → SynthID removed). Both features are opt-in with `--protect-text` / `--protect-faces` and considered **experimental**. If you enable them, verify the result with the oracle.
+> **`--pipeline controlnet` preserves text and face structure.** It runs the same SDXL img2img scrub but adds a canny ControlNet that conditions the regeneration on the image's edge map, so text and structure stay sharp at the strengths that remove SynthID. The watermark removal still comes from the img2img regeneration (`--strength`); the ControlNet only preserves structure — no original pixels are copied or frozen, so SynthID does not survive. `--controlnet-scale` tunes the preservation strength (higher = closer to the original structure). Runs fp32 on mps/cpu (fp16 only on cuda/xpu, where the fp16-fixed SDXL VAE is loaded automatically).
 >
-> **`--pipeline ctrlregen` is experimental and not recommended.** On paper CtrlRegen ([ICLR 2025](https://github.com/yepengliu/CtrlRegen)) regenerates from near-clean Gaussian noise to defeat robust watermarks, but in testing on real images it **destroys content** — smooth and background regions fill with hallucinated micro-text — and it is heavy (several GB of extra models, minutes per image). It has no usable middle setting (too low removes nothing, high enough to remove wrecks the image), so the shippable path is the default SDXL pipeline at the vendor-adaptive strength. CtrlRegen stays available for experimentation only.
+> **Face identity is not preserved yet.** Canny preserves where a face is, but not who it is — the regenerated face drifts in likeness. (An IP-Adapter FaceID approach was tried and removed: it needs high denoise strength and corrupts faces at the low strength used for removal.) The validated direction is a separate face-restoration post-pass (CodeFormer/GFPGAN at a low fidelity weight, run after the removal pass — it re-synthesizes each face from a codebook, so it scrubs the watermark while holding identity) — researched and prototyped (see `docs/controlnet-removal-pipeline-research.md`) but not yet shipped.
 
 SDXL is the default since May 2026: empirically defeats SynthID v2 on Gemini 3 Pro outputs, where the older SD-1.5 pipeline at 768 px did not. The SD-1.5 path was removed once it was verified not to handle v2. Note the scope: this defeats the SynthID *verifier*, which is not the same as being forensically indistinguishable from a real photo. Recent work ([arXiv:2605.09203](https://arxiv.org/abs/2605.09203)) shows watermark-removal pipelines leave detectable traces, so a separate "this image was processed" classifier can still flag the output.
 
@@ -127,11 +127,9 @@ SDXL is the default since May 2026: empirically defeats SynthID v2 on Gemini 3 P
 
 > **Technical deep-dive:** see [`docs/synthid.md`](docs/synthid.md) for a primary-source-cited breakdown of how SynthID works mechanically (post-hoc encoder/decoder, 136-bit payload, pixel-space embedding), what it empirically survives (JPEG, crop, resize: ~99.98% TPR at 0.1% FPR from arXiv:2510.09263), what removes it, and the forensic-stealth tradeoff (all known removal attacks are detectable at >98% TPR@1%FPR per arXiv:2605.09203).
 
-**Face Protection** (experimental, opt-in `--protect-faces`): before diffusion, YOLO detects people in the image and extracts them; after diffusion the original faces are blended back. Off by default — enable only when face fidelity matters more than SynthID removal completeness.
+**Text and face preservation** (opt-in `--pipeline controlnet`): adds a canny ControlNet so text and face *structure* stay sharp through the removal pass, without copying or freezing any original pixels (so SynthID is still removed). Tune the preservation strength with `--controlnet-scale`. Canny preserves structure but not face *identity* (preserving identity is a future face-restoration post-pass, not yet shipped — see the callout above).
 
 **Analog Humanizer**: optional film grain and chromatic aberration injection that mimics a photo of a screen, raising the bar for AI-generated image classifiers. (It frustrates generic classifiers but does not guarantee forensic invisibility — see the [arXiv:2605.09203](https://arxiv.org/abs/2605.09203) note above.)
-
-**Text Protection** (experimental, opt-in `--protect-text`): re-scrubs detected text blocks at high resolution after the global pass to keep small glyphs crisp. **Off by default** because the high-resolution re-scrub can preserve SynthID in text regions even after the global pass removes it elsewhere. Enable only when text fidelity matters more than watermark removal completeness, and verify the oracle result. SDXL pipeline only.
 
 ### Stripping C2PA, EXIF, and "Made with AI" metadata
 
@@ -274,8 +272,8 @@ remove-ai-watermarks invisible image.png -o clean.png --humanize 4.0
 # Runs at native resolution by default. On a very large image that OOMs the
 # GPU/MPS, cap the long side: --max-resolution 2048
 # Strength is vendor-adaptive by default (OpenAI 0.10 / Google 0.15); override
-# with --strength. Text/face protection is opt-in (--protect-text /
-# --protect-faces, experimental: they can shield SynthID).
+# with --strength. To preserve text/face structure, use --pipeline controlnet
+# (SDXL + canny ControlNet); tune preservation with --controlnet-scale. Add
 
 # Check / strip AI metadata (C2PA, EXIF, "Made with AI" labels)
 # --check also flags SynthID-bearing sources: a C2PA manifest signed by
@@ -341,7 +339,7 @@ pip install certifi
 
 - [noai-watermark](https://github.com/mertizci/noai-watermark) by mertizci — invisible watermark removal engine
 - [GeminiWatermarkTool](https://github.com/allenk/GeminiWatermarkTool) by Allen Kuo (MIT) — visible watermark removal algorithm
-- [CtrlRegen](https://github.com/yepengliu/CtrlRegen) by Liu et al. (ICLR 2025) — controllable regeneration pipeline
+- [controlnet-canny-sdxl-1.0](https://huggingface.co/xinsir/controlnet-canny-sdxl-1.0) by xinsir — SDXL canny ControlNet used by the `controlnet` pipeline to preserve text/face structure
 - NeuralBleach (MIT) — analog humanizer technique
 
 ## Roadmap

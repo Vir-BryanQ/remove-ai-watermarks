@@ -49,10 +49,7 @@ gpu = [
     "transformers>=5,<6",
     "tokenizers>=0.22,<0.23",
     "accelerate>=0.25.0",
-    "controlnet-aux>=0.0.9",
     "safetensors",
-    "ultralytics>=8.0.0",
-    "color-matcher>=0.5.0",
 ]
 # Open invisible-watermark (imwatermark) decoder for detecting the DWT-DCT
 # watermarks embedded by Stable Diffusion / SDXL / FLUX. Optional because it
@@ -150,7 +147,6 @@ ignore = [
 "tests/*.py" = ["ANN", "S101", "S105", "S106", "S108"]
 "src/remove_ai_watermarks/noai/watermark_remover.py" = ["S603", "S606", "S607", "T201"]  # subprocess calls for auto-install/CUDA fix
 "src/remove_ai_watermarks/noai/c2pa.py" = ["S110"]  # try-except-pass for corrupt file handling
-"src/remove_ai_watermarks/noai/ctrlregen/engine.py" = ["S101", "S603"]  # assert for loaded state, subprocess for auto-install
 
 [tool.ruff.format]
 quote-style = "double"
@@ -172,33 +168,3 @@ reportUnknownMemberType = false
 reportUnknownArgumentType = false
 reportUnknownVariableType = false
 reportMissingTypeArgument = false
-
-# CtrlRegen is a torch/diffusers/controlnet-aux boundary: those libs ship no
-# usable types, so strict pyright cannot know the tensor element types. Relax the
-# unknown-type rules for this subpackage only (mirrors the per-file pragmas used
-# for the cv2 engines); the rest of the codebase stays strict.
-[[tool.pyright.executionEnvironments]]
-root = "src/remove_ai_watermarks/noai/ctrlregen"
-reportUnknownMemberType = false
-reportUnknownArgumentType = false
-reportUnknownVariableType = false
-reportUnknownParameterType = false
-reportMissingTypeArgument = false
-reportMissingTypeStubs = false
-reportMissingImports = false
-reportArgumentType = false
-reportAssignmentType = false
-reportReturnType = false
-reportCallIssue = false
-reportIndexIssue = false
-reportOperatorIssue = false
-reportOptionalMemberAccess = false
-reportOptionalCall = false
-reportOptionalSubscript = false
-reportOptionalOperand = false
-reportAttributeAccessIssue = false
-reportPrivateImportUsage = false
-reportPrivateUsage = false
-reportInvalidTypeForm = false
-reportConstantRedefinition = false
-reportUnnecessaryComparison = false

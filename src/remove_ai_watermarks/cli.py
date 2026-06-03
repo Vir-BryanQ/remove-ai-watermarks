@@ -136,23 +136,14 @@ def _validate_image(path: Path) -> Path:
 
 _ALPHA_FORMATS = {".png", ".webp"}
 
-# Shared option decorators for commands that run the invisible-watermark pipeline.
-# Both cmd_invisible and cmd_all expose these flags; defining them once avoids
+# Shared option decorator for commands that run the invisible-watermark pipeline.
+# Both cmd_invisible and cmd_all expose this flag; defining it once avoids
 # copy-paste drift.
-_protect_text_option = click.option(
-    "--protect-text",
-    is_flag=True,
-    default=False,
-    help=(
-        "Enable text region protection (experimental: re-scrubs text blocks at high resolution). "
-        "May prevent SynthID removal in text areas -- verify with oracle before relying on it."
-    ),
-)
-_protect_faces_option = click.option(
-    "--protect-faces",
-    is_flag=True,
-    default=False,
-    help="Enable face protection (experimental: YOLO detect + blend original faces back).",
+_controlnet_scale_option = click.option(
+    "--controlnet-scale",
+    type=float,
+    default=1.0,
+    help="ControlNet conditioning scale (structure/text preservation strength), controlnet pipeline only.",
 )
 
 
@@ -453,14 +444,15 @@ def cmd_erase(
     type=float,
     default=None,
     help="Denoising strength (0.0-1.0). Default: vendor-adaptive (OpenAI 0.10 / Google 0.15 / "
-    "unknown 0.15, from the C2PA issuer); ctrlregen uses 1.0.",
+    "unknown 0.15, from the C2PA issuer).",
 )
 @click.option("--steps", type=int, default=50, help="Number of denoising steps. Default: 50.")
 @click.option(
     "--pipeline",
-    type=click.Choice(["default", "ctrlregen"]),
+    type=click.Choice(["default", "controlnet"]),
     default="default",
-    help="Pipeline profile (default=SDXL; ctrlregen=CtrlRegen, EXPERIMENTAL/destructive at clean-noise).",
+    help="Pipeline profile (default=SDXL img2img; controlnet=SDXL + canny ControlNet that preserves "
+    "text/faces via edge conditioning while removing SynthID).",
 )
 @click.option(
     "--device",
@@ -479,8 +471,7 @@ def cmd_erase(
     default=0,
     help="Cap long side (px) before diffusion; 0 = native (best quality, like raiw.cc). Raise only on GPU/MPS OOM.",
 )
-@_protect_text_option
-@_protect_faces_option
+@_controlnet_scale_option
 @click.pass_context
 def cmd_invisible(
     ctx: click.Context,
@@ -494,8 +485,7 @@ def cmd_invisible(
     hf_token: str | None,
     humanize: float,
     max_resolution: int,
-    protect_text: bool,
-    protect_faces: bool,
+    controlnet_scale: float,
 ) -> None:
     """Remove invisible AI watermarks (SynthID, StableSignature, TreeRing).
 
@@ -526,6 +516,7 @@ def cmd_invisible(
         pipeline=pipeline,
         hf_token=hf_token,
         progress_callback=progress_cb,
+        controlnet_conditioning_scale=controlnet_scale,
     )
 
     # Detect the SynthID vendor from the ORIGINAL (before processing strips C2PA) so the
@@ -533,7 +524,7 @@ def cmd_invisible(
     vendor = vendor_for_strength(source)
     console.print(f"  Input:    {source.name}")
     console.print(f"  Pipeline: {pipeline}")
-    console.print(f"  Strength: {resolve_strength(strength, pipeline, vendor)}  Steps: {steps}")
+    console.print(f"  Strength: {resolve_strength(strength, vendor)}  Steps: {steps}")
 
     t0 = time.monotonic()
     result_path = engine.remove_watermark(
@@ -544,8 +535,6 @@ def cmd_invisible(
         guidance_scale=None,
         seed=seed,
         humanize=humanize,
-        protect_text=protect_text,
-        protect_faces=protect_faces,
         max_resolution=max_resolution,
         vendor=vendor,
     )
@@ -694,15 +683,15 @@ def cmd_identify(ctx: click.Context, source: Path, no_visible: bool, as_json: bo
     "--strength",
     type=float,
     default=None,
-    help="Invisible watermark denoising strength. Default: vendor-adaptive "
-    "(OpenAI 0.10 / Google 0.15 / unknown 0.15); ctrlregen uses 1.0.",
+    help="Invisible watermark denoising strength. Default: vendor-adaptive (OpenAI 0.10 / Google 0.15 / unknown 0.15).",
 )
 @click.option("--steps", type=int, default=50, help="Number of denoising steps for invisible removal.")
 @click.option(
     "--pipeline",
-    type=click.Choice(["default", "ctrlregen"]),
+    type=click.Choice(["default", "controlnet"]),
     default="default",
-    help="Pipeline profile (default=SDXL; ctrlregen=CtrlRegen, EXPERIMENTAL/destructive at clean-noise).",
+    help="Pipeline profile (default=SDXL img2img; controlnet=SDXL + canny ControlNet that preserves "
+    "text/faces via edge conditioning while removing SynthID).",
 )
 @click.option("--model", type=str, default=None, help="HuggingFace model ID for invisible removal.")
 @click.option(
@@ -722,8 +711,7 @@ def cmd_identify(ctx: click.Context, source: Path, no_visible: bool, as_json: bo
     default=0,
     help="Cap long side (px) before diffusion; 0 = native (best quality, like raiw.cc). Raise only on GPU/MPS OOM.",
 )
-@_protect_text_option
-@_protect_faces_option
+@_controlnet_scale_option
 @click.pass_context
 def cmd_all(
     ctx: click.Context,
@@ -740,8 +728,7 @@ def cmd_all(
     hf_token: str | None,
     humanize: float,
     max_resolution: int,
-    protect_text: bool,
-    protect_faces: bool,
+    controlnet_scale: float,
 ) -> None:
     """Remove ALL watermarks: visible + invisible + metadata.
 
@@ -822,13 +809,14 @@ def cmd_all(
                 pipeline=pipeline,
                 hf_token=hf_token,
                 progress_callback=progress_cb,
+                controlnet_conditioning_scale=controlnet_scale,
             )
 
             # Detect the vendor from the pristine ORIGINAL (`source`); `tmp_path` has
             # already lost its C2PA to the visible-removal pass, so reading it would
             # always resolve to the unknown-vendor default.
             vendor = vendor_for_strength(source)
-            console.print(f"    Strength: {resolve_strength(strength, pipeline, vendor)}  Steps: {steps}")
+            console.print(f"    Strength: {resolve_strength(strength, vendor)}  Steps: {steps}")
             inv_engine.remove_watermark(
                 image_path=tmp_path,
                 output_path=tmp_path,
@@ -836,8 +824,6 @@ def cmd_all(
                 num_inference_steps=steps,
                 seed=seed,
                 humanize=humanize,
-                protect_text=protect_text,
-                protect_faces=protect_faces,
                 max_resolution=max_resolution,
                 vendor=vendor,
             )
@@ -990,9 +976,10 @@ def _process_batch_image(
 )
 @click.option(
     "--pipeline",
-    type=click.Choice(["default", "ctrlregen"]),
+    type=click.Choice(["default", "controlnet"]),
     default="default",
-    help="Pipeline profile (default=SDXL; ctrlregen=CtrlRegen, EXPERIMENTAL/destructive at clean-noise).",
+    help="Pipeline profile (default=SDXL img2img; controlnet=SDXL + canny ControlNet that preserves "
+    "text/faces via edge conditioning while removing SynthID).",
 )
 @click.option(
     "--device",

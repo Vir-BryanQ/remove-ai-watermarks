@@ -1,13 +1,13 @@
 """Watermark removal using diffusion model regeneration attack.
 
-Based on the paper "Image Watermarks Are Removable Using Controllable
-Regeneration from Clean Noise" (ICLR 2025).
-
-This module implements a simple regeneration attack that:
-1. Encodes the watermarked image to latent space
-2. Adds noise via forward diffusion process
-3. Denoises via reverse diffusion process
-4. Decodes back to pixel space
+Two pipelines:
+1. ``default`` -- plain SDXL img2img. Partial-noise regeneration scrubs the
+   invisible watermark; ``strength`` controls how much is regenerated.
+2. ``controlnet`` -- SDXL img2img with a canny ControlNet. The watermark REMOVAL
+   still comes from the img2img regeneration (``strength``); the ControlNet only
+   PRESERVES structure (text/faces) by conditioning on the edge map. No original
+   pixels are ever copied or frozen, so SynthID does not survive.
+   ``controlnet_conditioning_scale`` is the preservation knob.
 """
 
 # torch/diffusers/cv2 boundary: these libs ship no usable types for the tensor and
@@ -29,10 +29,9 @@ if TYPE_CHECKING:
 from PIL import Image
 
 from remove_ai_watermarks.noai.watermark_profiles import (
-    CTRLREGEN_MODEL_ID,
+    CONTROLNET_CANNY_MODEL,
     DEFAULT_MODEL_ID,
     DEFAULT_STRENGTH,
-    detect_model_profile,
     resolve_strength,
 )
 
@@ -273,21 +272,14 @@ def _make_seed_generator(device: str, seed: int) -> Any:
         return torch.Generator().manual_seed(seed)  # type: ignore
 
 
-def _generator_device(generator: Any) -> str:
-    """Best-effort device type of a ``torch.Generator`` (e.g. ``"cpu"``, ``"mps"``)."""
-    device = getattr(generator, "device", None)
-    return getattr(device, "type", str(device)) if device is not None else "cpu"
+# Canny edge thresholds for the ControlNet control image (xinsir canny recipe:
+# cv2.Canny(gray, 100, 200) -> a 3-channel edge map).
+_CANNY_LOW = 100
+_CANNY_HIGH = 200
 
-
-# Keep legacy name available for backwards compatibility
-_detect_model_profile_from_id = detect_model_profile
-
-# SDXL Differential-Diffusion community pipeline, pinned to the installed
-# diffusers version so the fetched pipeline code matches the library (see #21).
-# Diffusers' dynamic-module loader resolves ``custom_revision`` against the
-# package version string (``0.38.0``), NOT the GitHub git tag (``v0.38.0``).
-_DIFF_PIPELINE_NAME = "pipeline_stable_diffusion_xl_differential_img2img"
-_DIFF_PIPELINE_REVISION = "0.38.0"
+# A neutral quality prompt: the goal is faithful regeneration, not creative edits.
+_CONTROLNET_PROMPT = "best quality, high quality, sharp, detailed, photographic"
+_CONTROLNET_NEGATIVE = "blurry, lowres, deformed, distorted text, garbled text, watermark, jpeg artifacts"
 
 
 class WatermarkRemover:
@@ -299,8 +291,8 @@ class WatermarkRemover:
     """
 
     DEFAULT_MODEL_ID = DEFAULT_MODEL_ID
-    CTRLREGEN_MODEL_ID = CTRLREGEN_MODEL_ID
     DEFAULT_STRENGTH = DEFAULT_STRENGTH
+    CONTROLNET_CANNY_MODEL = CONTROLNET_CANNY_MODEL
 
     def __init__(
         self,
@@ -309,9 +301,14 @@ class WatermarkRemover:
         torch_dtype: Any = None,
         progress_callback: Callable[[str], None] | None = None,
         hf_token: str | None = None,
+        pipeline: str = "default",
+        controlnet_conditioning_scale: float = 1.0,
     ) -> None:
         self.model_id = model_id or self.DEFAULT_MODEL_ID
-        self.model_profile = detect_model_profile(self.model_id)
+        # The pipeline profile is threaded explicitly (not inferred from model_id):
+        # both "default" and "controlnet" use the same SDXL base checkpoint.
+        self.model_profile = pipeline
+        self.controlnet_conditioning_scale = controlnet_conditioning_scale
 
         if not is_watermark_removal_available():
             _ensure_watermark_deps()
@@ -329,8 +326,7 @@ class WatermarkRemover:
             self.torch_dtype = torch_dtype
 
         self._pipeline: AutoImg2ImgPipeline | None = None
-        self._diff_pipeline: Any = None
-        self._ctrlregen_engine: Any = None
+        self._controlnet_pipeline: Any = None
         self._progress_callback = progress_callback
         self.hf_token: str | None = hf_token or os.environ.get("HF_TOKEN")
 
@@ -345,44 +341,59 @@ class WatermarkRemover:
 
     def preload(self) -> None:
         """Eagerly load the pipeline so download progress bars are visible."""
-        if self.model_profile == "ctrlregen":
-            self._run_ctrlregen_preload()
+        if self.model_profile == "controlnet":
+            self._load_controlnet_pipeline()
         else:
             self._load_pipeline()
 
-    def _run_ctrlregen_preload(self) -> None:
-        """Ensure the CtrlRegen engine and all its models are loaded."""
-        from remove_ai_watermarks.noai.ctrlregen import is_ctrlregen_available
-
-        if not is_ctrlregen_available():
-            missing_pkgs = ["controlnet-aux", "color-matcher", "safetensors"]
-            logger.info("Auto-installing missing CtrlRegen dependencies: %s", missing_pkgs)
-            if not _auto_install(missing_pkgs):
-                raise ImportError(
-                    f"Failed to auto-install missing dependencies: {', '.join(missing_pkgs)}. "
-                    "Try manually: pip install --force-reinstall noai-watermark"
-                )
-        if self._ctrlregen_engine is None:
-            self._ctrlregen_engine = self._make_ctrlregen_engine()
-        self._ctrlregen_engine.load()
-
-    def _make_ctrlregen_engine(self) -> Any:
-        """Create a new CtrlRegenEngine with current settings."""
-        from remove_ai_watermarks.noai.ctrlregen import CtrlRegenEngine
-
-        base_model = self.model_id if self.model_id != self.CTRLREGEN_MODEL_ID else None
-        return CtrlRegenEngine(
-            base_model_id=base_model,
-            device=self.device,
-            torch_dtype=self.torch_dtype,
-            hf_token=self.hf_token,
-            progress_callback=self._progress_callback,
-        )
-
     # ── Pipeline loading ─────────────────────────────────────────────
 
+    def _maybe_add_fp16_vae(self, load_kwargs: dict[str, Any]) -> None:
+        """Swap in the fp16-fixed SDXL VAE for the default checkpoint on a fp16 GPU.
+
+        The stock SDXL VAE overflows to NaN in fp16 and decodes to an all-black
+        image (issue #29). Shared by both pipeline loaders; a no-op on fp32 (cpu/mps)
+        or a non-SDXL checkpoint.
+        """
+        if _needs_fp16_vae_fix(self.model_id, self.DEFAULT_MODEL_ID, self.torch_dtype == torch.float16):
+            from diffusers import AutoencoderKL
+
+            self._set_progress("Loading fp16-fixed SDXL VAE (avoids black output)...")
+            load_kwargs["vae"] = AutoencoderKL.from_pretrained(_SDXL_FP16_VAE_ID, torch_dtype=torch.float16)
+
+    def _move_to_device_and_optimize(self, pipeline: Any) -> Any:
+        """Move a freshly-loaded pipeline to ``self.device`` + enable memory opts.
+
+        Shared by both loaders. On a CUDA move failure (missing CUDA torch build),
+        trigger the torch-CUDA reinstall+restart. Returns the moved pipeline.
+        """
+        self._set_progress(f"Moving model to device: {self.device}")
+        try:
+            pipeline = pipeline.to(self.device)
+        except (RuntimeError, AssertionError) as exc:
+            if self.device == "cuda" and not os.environ.get(_CUDA_FIX_ENV_KEY):
+                self._set_progress("CUDA failed. Reinstalling torch with CUDA support...")
+                _reinstall_torch_cuda_and_restart()
+            raise RuntimeError(
+                f"Failed to move model to {self.device} ({exc}). "
+                "Install CUDA-enabled PyTorch manually:\n"
+                f"  pip install torch --index-url {_detect_cuda_index_url()}"
+            ) from exc
+
+        if hasattr(pipeline, "enable_xformers_memory_efficient_attention"):
+            with contextlib.suppress(Exception):
+                self._set_progress("Enabling memory optimizations...")
+                pipeline.enable_xformers_memory_efficient_attention()
+
+        # Mac Float32 memory slicing
+        if self.device == "mps" and hasattr(pipeline, "enable_attention_slicing"):
+            with contextlib.suppress(Exception):
+                pipeline.enable_attention_slicing("max")
+
+        return pipeline
+
     def _load_pipeline(self) -> AutoImg2ImgPipeline:
-        """Load the diffusion pipeline lazily."""
+        """Load the plain SDXL img2img pipeline lazily."""
         if self._pipeline is None:
             logger.info("Loading model %s on %s...", self.model_id, self.device)
             self._set_progress(f"Loading model weights: {self.model_id}")
@@ -394,47 +405,46 @@ class WatermarkRemover:
             }
             if self.hf_token:
                 load_kwargs["token"] = self.hf_token
+            self._maybe_add_fp16_vae(load_kwargs)
 
-            # Avoid the SDXL fp16 NaN/all-black decode (issue #29) by loading the
-            # fp16-fixed VAE for the default SDXL checkpoint on a fp16 GPU.
-            if _needs_fp16_vae_fix(self.model_id, self.DEFAULT_MODEL_ID, self.torch_dtype == torch.float16):
-                from diffusers import AutoencoderKL
-
-                self._set_progress("Loading fp16-fixed SDXL VAE (avoids black output)...")
-                load_kwargs["vae"] = AutoencoderKL.from_pretrained(_SDXL_FP16_VAE_ID, torch_dtype=torch.float16)
-
-            self._pipeline = AutoImg2ImgPipeline.from_pretrained(  # type: ignore
-                self.model_id,
-                **load_kwargs,
-            )
-
-            self._set_progress(f"Moving model to device: {self.device}")
-            try:
-                self._pipeline = self._pipeline.to(self.device)  # type: ignore
-            except (RuntimeError, AssertionError) as exc:
-                if self.device == "cuda" and not os.environ.get(_CUDA_FIX_ENV_KEY):
-                    self._set_progress("CUDA failed. Reinstalling torch with CUDA support...")
-                    _reinstall_torch_cuda_and_restart()
-                raise RuntimeError(
-                    f"Failed to move model to {self.device} ({exc}). "
-                    "Install CUDA-enabled PyTorch manually:\n"
-                    f"  pip install torch --index-url {_detect_cuda_index_url()}"
-                ) from exc
-
-            if hasattr(self._pipeline, "enable_xformers_memory_efficient_attention"):
-                with contextlib.suppress(Exception):
-                    self._set_progress("Enabling memory optimizations...")
-                    self._pipeline.enable_xformers_memory_efficient_attention()  # type: ignore
-
-            # Mac Float32 memory slicing
-            if self.device == "mps" and hasattr(self._pipeline, "enable_attention_slicing"):
-                with contextlib.suppress(Exception):
-                    self._pipeline.enable_attention_slicing("max")
+            pipeline = AutoImg2ImgPipeline.from_pretrained(self.model_id, **load_kwargs)  # type: ignore
+            self._pipeline = self._move_to_device_and_optimize(pipeline)
 
             logger.info("Model loaded successfully")
             self._set_progress("Model initialized. Preparing input image...")
 
         return self._pipeline  # type: ignore
+
+    def _load_controlnet_pipeline(self) -> Any:
+        """Load the SDXL + canny-ControlNet img2img pipeline lazily.
+
+        Mirrors ``_load_pipeline`` (same fp16-fix VAE, device move, attention
+        slicing via the shared helpers) but loads the canny ControlNet on top of
+        the SDXL base. The ControlNet only preserves structure via the edge map;
+        removal still comes from the img2img regeneration (``strength``).
+        """
+        if self._controlnet_pipeline is None:
+            from diffusers import ControlNetModel, StableDiffusionXLControlNetImg2ImgPipeline
+
+            logger.info("Loading SDXL + ControlNet (%s) on %s...", CONTROLNET_CANNY_MODEL, self.device)
+            self._set_progress(f"Loading ControlNet: {CONTROLNET_CANNY_MODEL}")
+            controlnet = ControlNetModel.from_pretrained(CONTROLNET_CANNY_MODEL, torch_dtype=self.torch_dtype)
+
+            load_kwargs: dict[str, Any] = {"controlnet": controlnet, "torch_dtype": self.torch_dtype}
+            if self.hf_token:
+                load_kwargs["token"] = self.hf_token
+            self._maybe_add_fp16_vae(load_kwargs)
+
+            self._set_progress(f"Loading model weights: {self.model_id}")
+            pipeline = StableDiffusionXLControlNetImg2ImgPipeline.from_pretrained(self.model_id, **load_kwargs)
+            pipeline = self._move_to_device_and_optimize(pipeline)
+            with contextlib.suppress(Exception):
+                pipeline.set_progress_bar_config(disable=True)
+
+            logger.info("ControlNet model loaded successfully")
+            self._controlnet_pipeline = pipeline
+
+        return self._controlnet_pipeline
 
     # ── Core removal ─────────────────────────────────────────────────
 
@@ -446,7 +456,6 @@ class WatermarkRemover:
         num_inference_steps: int = 50,
         guidance_scale: float | None = None,
         seed: int | None = None,
-        protect_text: bool = True,
         vendor: str | None = None,
     ) -> Path:
         """Remove watermark from an image using regeneration attack.
@@ -459,10 +468,6 @@ class WatermarkRemover:
             num_inference_steps: Number of denoising steps.
             guidance_scale: Classifier-free guidance scale.
             seed: Random seed for reproducibility.
-            protect_text: Detect text regions and preserve them via Differential
-                Diffusion when any are found (SDXL default profile only). On by
-                default; the detector decides per image, and text-free inputs run
-                the standard pass at no extra cost.
             vendor: SynthID vendor (``"openai"`` / ``"google"`` / None) used to pick the
                 default strength when ``strength`` is None. Detect it from the ORIGINAL
                 input with ``watermark_profiles.vendor_for_strength`` before processing
@@ -482,13 +487,13 @@ class WatermarkRemover:
         if output_path is None:
             output_path = image_path
 
-        strength = resolve_strength(strength, self.model_profile, vendor)
+        strength = resolve_strength(strength, vendor)
 
         if not 0.0 <= strength <= 1.0:
             raise ValueError(f"Strength must be between 0.0 and 1.0, got {strength}")
 
         if guidance_scale is None:
-            guidance_scale = 2.0 if self.model_profile == "ctrlregen" else 7.5
+            guidance_scale = 7.5
 
         self._set_progress("Loading and preprocessing input image...")
         init_image = Image.open(image_path).convert("RGB")
@@ -508,16 +513,8 @@ class WatermarkRemover:
 
         _total_start = time.monotonic()
 
-        if self.model_profile == "ctrlregen":
-            cleaned_image = self._run_ctrlregen(
-                init_image,
-                strength,
-                num_inference_steps,
-                guidance_scale,
-                generator,
-            )
-        elif protect_text and self._can_protect_text():
-            cleaned_image = self._run_region_hires(
+        if self.model_profile == "controlnet":
+            cleaned_image = self._run_controlnet(
                 init_image,
                 strength,
                 num_inference_steps,
@@ -525,12 +522,6 @@ class WatermarkRemover:
                 generator,
             )
         else:
-            if protect_text:
-                logger.debug(
-                    "Text protection unavailable "
-                    "(needs the SDXL default model and the cv2 text detector); "
-                    "running standard img2img."
-                )
             cleaned_image = self._run_img2img(
                 init_image,
                 strength,
@@ -613,148 +604,25 @@ class WatermarkRemover:
         self._pipeline = None
         return self._load_pipeline()
 
-    # ── Text-protected differential runner ───────────────────────────
+    # ── ControlNet runner ────────────────────────────────────────────
 
-    def _can_protect_text(self) -> bool:
-        """True when text protection can run: SDXL default model + cv2 detector."""
-        from remove_ai_watermarks import text_protector
+    def _build_canny_control_image(self, init_image: Image.Image) -> Image.Image:
+        """Build the canny ControlNet conditioning image (xinsir recipe).
 
-        return self.model_id == self.DEFAULT_MODEL_ID and text_protector.is_available()
-
-    def _load_differential_pipeline(self) -> Any:
-        """Load the SDXL Differential-Diffusion community pipeline lazily."""
-        if self._diff_pipeline is None:
-            from diffusers import DiffusionPipeline
-
-            self._set_progress("Loading Differential-Diffusion pipeline (protect-text)...")
-            use_fp16 = self.device in {"mps", "cuda", "xpu"}
-            load_kwargs: dict[str, Any] = {
-                "custom_pipeline": _DIFF_PIPELINE_NAME,
-                "custom_revision": _DIFF_PIPELINE_REVISION,
-                "torch_dtype": torch.float16 if use_fp16 else torch.float32,  # type: ignore[attr-defined]
-                "use_safetensors": True,
-            }
-            if use_fp16:
-                load_kwargs["variant"] = "fp16"
-            if self.hf_token:
-                load_kwargs["token"] = self.hf_token
-
-            pipeline = DiffusionPipeline.from_pretrained(self.model_id, **load_kwargs).to(self.device)
-            # The differential pipeline upcasts the SDXL VAE to fp32 internally
-            # (the fp16 VAE decodes to NaN/black otherwise), so we add no extra
-            # VAE handling here. Attention slicing is also left off on MPS: it
-            # produced NaN latents with this pipeline, and the protect-text pass
-            # is short enough not to need it.
-            with contextlib.suppress(Exception):
-                pipeline.set_progress_bar_config(disable=True)
-            self._diff_pipeline = pipeline
-        return self._diff_pipeline
-
-    def _reload_differential_on_cpu(self) -> Any:
-        """Reload the differential pipeline on CPU after an MPS failure."""
-        self.device = "cpu"
-        self.torch_dtype = torch.float32  # type: ignore[assignment]
-        self._diff_pipeline = None
-        return self._load_differential_pipeline()
-
-    # Region high-res text scrub: defaults tuned so each text block is upscaled
-    # enough that strokes exceed the VAE's ~8px latent cell, capped so a single
-    # region never blows past the GPU/MPS memory budget.
-    _REGION_HIRES_SCALE = 3.0
-    _REGION_MAX_MEGAPIXELS = 1.3
-
-    def _run_region_hires(
-        self,
-        init_image: Image.Image,
-        strength: float,
-        num_inference_steps: int,
-        guidance_scale: float,
-        generator: Any,
-    ) -> Image.Image:
-        """Scrub the whole image, then RE-scrub each detected text block at high
-        resolution and composite it back.
-
-        Unlike the Differential-Diffusion path (which freezes text in latent space
-        and so leaves the watermark intact there), every pixel here is regenerated
-        -- the watermark is removed everywhere. Small text survives because each
-        text block is upscaled before its img2img pass, so strokes span more than
-        one VAE latent cell (the ~8px floor that softens text at native scale);
-        the scrubbed crop is downscaled and feather-composited back. Falls back to
-        the plain global scrub when no text is detected.
+        cv2.Canny on the RGB->gray array, stacked to 3 channels, wrapped as a PIL
+        image. The edge map only PRESERVES structure; it never copies pixels.
+        ``init_image`` is already RGB (``remove_watermark`` converts on load).
         """
-        import math
-
         import cv2
         import numpy as np
 
-        from remove_ai_watermarks import text_protector
+        rgb = np.array(init_image)
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(gray, _CANNY_LOW, _CANNY_HIGH)
+        edges_rgb = np.stack([edges, edges, edges], axis=-1)
+        return Image.fromarray(edges_rgb)
 
-        base = self._run_img2img(init_image, strength, num_inference_steps, guidance_scale, generator)
-
-        # The base pass may have fallen back from MPS to CPU (it flips
-        # self.device). The generator was built for the original device, and
-        # diffusers rejects a device-mismatched generator ("Expected a 'cpu'
-        # device generator but found 'mps'"), so drop it for the per-region
-        # passes -- they then seed from the global RNG, which is fine here.
-        if generator is not None and self.device == "cpu" and _generator_device(generator) != "cpu":
-            generator = None
-
-        bgr = cv2.cvtColor(np.array(init_image), cv2.COLOR_RGB2BGR)
-        try:
-            boxes = text_protector.TextProtector().detect_text_boxes(bgr)
-        except Exception as exc:
-            logger.warning("Text detection failed (%s); keeping the global scrub.", exc)
-            return base
-        if not boxes:
-            self._set_progress("No text detected; global scrub only.")
-            return base
-
-        width, height = init_image.size
-        regions = text_protector.merge_text_regions(boxes, height, width)
-        orig_bgr = cv2.cvtColor(np.array(init_image), cv2.COLOR_RGB2BGR)
-        out_bgr = cv2.cvtColor(np.array(base), cv2.COLOR_RGB2BGR)
-        budget = self._REGION_MAX_MEGAPIXELS * 1_000_000
-
-        done = 0
-        for x, y, w, h in regions:
-            area = max(1, w * h)
-            # INTEGER scale so the upscale -> scrub -> downscale round-trip is an
-            # exact dimensional inverse (a fractional factor truncates and shifts
-            # the composited text ~1-2px, which is invisible but tanks alignment).
-            scale = int(min(self._REGION_HIRES_SCALE, math.sqrt(budget / area)))
-            if scale < 2:
-                # Region too large to even double within the budget: upscaling
-                # buys nothing here; the global scrub covers it (documented limit
-                # for very large text areas -- tiling is the future fix).
-                continue
-            crop = orig_bgr[y : y + h, x : x + w]
-            up = cv2.resize(crop, (w * scale, h * scale), interpolation=cv2.INTER_LANCZOS4)
-            up_pil = Image.fromarray(cv2.cvtColor(up, cv2.COLOR_BGR2RGB))
-            scrubbed = self._run_img2img(up_pil, strength, num_inference_steps, guidance_scale, generator)
-            down = cv2.resize(cv2.cvtColor(np.array(scrubbed), cv2.COLOR_RGB2BGR), (w, h), interpolation=cv2.INTER_AREA)
-            # The up -> scrub -> down round-trip can offset the re-rendered text by
-            # a pixel or two (the diffusion pipeline rounds dims to a multiple of
-            # 8, so the inverse resize is not perfectly centered). Phase-correlate
-            # the patch back to the original crop and translate it so the glyphs
-            # land exactly where they were -- otherwise a sub-pixel shift garbles
-            # the composite even though the text is crisp.
-            cg = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).astype(np.float32)
-            dg = cv2.cvtColor(down, cv2.COLOR_BGR2GRAY).astype(np.float32)
-            (sx, sy), resp = cv2.phaseCorrelate(cg, dg)
-            # Only correct for the real 1-2px round-trip shift. On a near-flat /
-            # low-contrast crop phaseCorrelate returns a spurious large offset at
-            # a tiny response (e.g. (19,19) at resp ~0.005); warping by that
-            # garbles the composite -- the exact failure this was meant to
-            # prevent. Gate on both a confident response and a plausible offset.
-            if resp > 0.3 and abs(sx) < 4 and abs(sy) < 4 and (abs(sx) > 0.1 or abs(sy) > 0.1):
-                m = np.float32([[1, 0, -sx], [0, 1, -sy]])
-                down = cv2.warpAffine(down, m, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-            out_bgr = text_protector.feather_paste(out_bgr, down, x, y)
-            done += 1
-        self._set_progress(f"Re-scrubbed {done}/{len(regions)} text region(s) at high resolution.")
-        return Image.fromarray(cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB))
-
-    def _run_differential(
+    def _run_controlnet(
         self,
         init_image: Image.Image,
         strength: float,
@@ -762,105 +630,50 @@ class WatermarkRemover:
         guidance_scale: float,
         generator: Any,
     ) -> Image.Image:
-        """Run differential img2img that preserves detected text regions."""
-        import cv2
-        import numpy as np
+        """Run the SDXL + canny-ControlNet img2img pass.
 
-        from remove_ai_watermarks import text_protector
+        Removal still comes from the img2img regeneration (``strength``); the canny
+        ControlNet only PRESERVES text and face STRUCTURE via the edge map. No
+        original pixels are copied/frozen, so SynthID does not survive (canny holds
+        structure, not face identity). ``controlnet_conditioning_scale`` is the
+        structure-preservation knob. Shares the img2img runner (live progress +
+        MPS->CPU fallback) with ``_run_img2img``; the only delta is the extra
+        ControlNet kwargs (canny control image + conditioning scale + a non-empty
+        prompt) overlaid via ``extra_kwargs``.
+        """
+        from remove_ai_watermarks.noai.img2img_runner import run_img2img_with_mps_fallback
 
-        self._set_progress("Detecting text regions to protect (protect-text)...")
-        bgr = cv2.cvtColor(np.array(init_image), cv2.COLOR_RGB2BGR)
-        try:
-            boxes = text_protector.TextProtector().detect_text_boxes(bgr)
-        except Exception as exc:
-            logger.warning("Text detection failed (%s); running standard img2img.", exc)
-            return self._run_img2img(init_image, strength, num_inference_steps, guidance_scale, generator)
-
-        if not boxes:
-            self._set_progress("No text detected; running standard img2img.")
-            return self._run_img2img(init_image, strength, num_inference_steps, guidance_scale, generator)
-
-        width, height = init_image.size
-        change_map = text_protector.build_change_map(boxes, height, width)
-        self._set_progress(f"Protecting {len(boxes)} text region(s) via Differential Diffusion...")
-
-        from remove_ai_watermarks.noai.img2img_runner import run_differential_with_mps_fallback
-
-        result_image, final_device = run_differential_with_mps_fallback(
-            load_pipeline=self._load_differential_pipeline,
+        extra_kwargs = {
+            "prompt": _CONTROLNET_PROMPT,
+            "negative_prompt": _CONTROLNET_NEGATIVE,
+            "control_image": self._build_canny_control_image(init_image),
+            "controlnet_conditioning_scale": float(self.controlnet_conditioning_scale),
+        }
+        result_image, final_device = run_img2img_with_mps_fallback(
+            load_pipeline=self._load_controlnet_pipeline,
             image=init_image,
-            change_map=change_map,
             strength=strength,
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale,
             generator=generator,
             device=self.device,
             set_progress=self._set_progress,
-            reload_on_cpu=self._reload_differential_on_cpu,
+            reload_on_cpu=self._reload_controlnet_on_cpu,
+            extra_kwargs=extra_kwargs,
         )
+
         if final_device != self.device:
             self.device = final_device
             self.torch_dtype = torch.float32  # type: ignore[assignment]
+
         return result_image
 
-    # ── CtrlRegen runner ─────────────────────────────────────────────
-
-    def _run_ctrlregen(
-        self,
-        init_image: Image.Image,
-        strength: float,
-        num_inference_steps: int,
-        guidance_scale: float,
-        generator: Any,
-    ) -> Image.Image:
-        """Run CtrlRegen pipeline with MPS fallback."""
-        from remove_ai_watermarks.noai.ctrlregen import is_ctrlregen_available
-        from remove_ai_watermarks.noai.progress import is_mps_error
-
-        if not is_ctrlregen_available():
-            missing_pkgs = ["controlnet-aux", "color-matcher", "safetensors"]
-            logger.info("Auto-installing missing CtrlRegen dependencies: %s", missing_pkgs)
-            if not _auto_install(missing_pkgs):
-                raise ImportError(
-                    f"Failed to auto-install missing dependencies: {', '.join(missing_pkgs)}. "
-                    "Try manually: pip install --force-reinstall noai-watermark"
-                )
-
-        if self._ctrlregen_engine is None:
-            self._ctrlregen_engine = self._make_ctrlregen_engine()
-
-        seed = None
-        if generator is not None and hasattr(generator, "initial_seed"):
-            seed = generator.initial_seed()
-
-        try:
-            return self._ctrlregen_engine.run(
-                image=init_image,
-                strength=strength,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=guidance_scale,
-                seed=seed,
-            )
-        except RuntimeError as error:
-            if self.device == "mps" and is_mps_error(error):
-                logger.warning("MPS out of memory during CtrlRegen. Falling back to CPU.")
-                self._set_progress("MPS out of memory! Retrying CtrlRegen on CPU...")
-                with contextlib.suppress(Exception):
-                    if _HAS_TORCH and hasattr(torch, "mps"):
-                        torch.mps.empty_cache()  # type: ignore[attr-defined]
-
-                self.device = "cpu"
-                self.torch_dtype = torch.float32  # type: ignore[assignment]
-                self._ctrlregen_engine = self._make_ctrlregen_engine()
-
-                return self._ctrlregen_engine.run(
-                    image=init_image,
-                    strength=strength,
-                    num_inference_steps=num_inference_steps,
-                    guidance_scale=guidance_scale,
-                    seed=seed,
-                )
-            raise
+    def _reload_controlnet_on_cpu(self) -> Any:
+        """Reload the controlnet pipeline on CPU after an MPS failure."""
+        self.device = "cpu"
+        self.torch_dtype = torch.float32  # type: ignore[assignment]
+        self._controlnet_pipeline = None
+        return self._load_controlnet_pipeline()
 
     # ── Batch ────────────────────────────────────────────────────────
 
@@ -909,9 +722,9 @@ def remove_watermark(
 ) -> Path:
     """Convenience function to remove watermark from an image.
 
-    ``strength=None`` lets the profile pick its default: vendor-adaptive for SDXL
+    ``strength=None`` lets the profile pick its vendor-adaptive SDXL default
     (0.10 OpenAI / 0.15 Google / 0.15 unknown, from the C2PA SynthID proxy on the
-    input), clean-noise 1.0 for ctrlregen. Pass a value to override.
+    input). Pass a value to override.
     """
     from remove_ai_watermarks.noai.watermark_profiles import vendor_for_strength
 

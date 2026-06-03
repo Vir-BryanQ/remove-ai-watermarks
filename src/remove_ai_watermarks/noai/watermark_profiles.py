@@ -1,4 +1,4 @@
-"""Watermark removal model profiles, the default strength, and profile detection.
+"""Watermark removal model profiles and the default strength.
 
 Pure configuration and lookup functions with no ML dependencies.
 """
@@ -11,13 +11,18 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 DEFAULT_MODEL_ID = "stabilityai/stable-diffusion-xl-base-1.0"
-CTRLREGEN_MODEL_ID = "yepengliu/ctrlregen"
+
+# The SDXL-native canny ControlNet used by the ``controlnet`` pipeline. The
+# ControlNet is an add-on to the SDXL base checkpoint (DEFAULT_MODEL_ID), not a
+# separate base model, so both the ``default`` and ``controlnet`` profiles load
+# the same base weights and share the same vendor-adaptive strength.
+CONTROLNET_CANNY_MODEL = "xinsir/controlnet-canny-sdxl-1.0"
 
 # Vendor-adaptive default denoising strength for the SDXL img2img scrub, overridable
 # from the CLI (`--strength`). The right strength depends on which vendor's SynthID is
 # present, detected from the C2PA issuer (metadata.synthid_source). Oracle-verified
-# controlled study (2026-06-01, clean v0.8.6 with protect_text/faces OFF, per-image
-# openai.com/verify or Gemini-app verdict; see docs/synthid.md section 2.2):
+# controlled study (2026-06-01, clean v0.8.6, per-image openai.com/verify or Gemini-app
+# verdict; see docs/synthid.md section 2.2):
 #   - OpenAI gpt-image: removed at 0.05 across 1024-1600 (n=4), resolution-independent.
 #     OPENAI_STRENGTH 0.10 = the 0.05 floor plus a 2x margin (keeps quality high).
 #   - Google Gemini: removed at 0.15 on the capped-1536 path (n=4); 0.05/0.10 do NOT
@@ -29,8 +34,8 @@ CTRLREGEN_MODEL_ID = "yepengliu/ctrlregen"
 #   - Unknown vendor (metadata stripped, or non-OpenAI/Google C2PA): UNKNOWN_STRENGTH
 #     0.15, the safe middle that clears both vendors at the tested resolutions.
 # The dominant factor is VENDOR, not resolution: Google's SynthID is ~3x more robust
-# than OpenAI's. The earlier single 0.30 default (and the "resolution dependence" lore)
-# came from contaminated tests run with protect_text ON -- see docs/synthid.md 2.2.
+# than OpenAI's. The ``controlnet`` pipeline shares these strengths (same SDXL base; the
+# canny ControlNet only preserves structure, the strength still drives removal).
 OPENAI_STRENGTH = 0.10
 GEMINI_STRENGTH = 0.15
 UNKNOWN_STRENGTH = 0.15
@@ -41,45 +46,21 @@ DEFAULT_STRENGTH = UNKNOWN_STRENGTH
 # Detected-vendor -> default strength. Vendor strings come from `vendor_for_strength`.
 _VENDOR_STRENGTH = {"openai": OPENAI_STRENGTH, "google": GEMINI_STRENGTH}
 
-# CtrlRegen removes watermarks by regenerating from (near) clean Gaussian noise,
-# NOT by the light-touch partial-noise img2img the SDXL default uses. The research
-# is explicit (CtrlRegen, ICLR 2025, arXiv:2410.05470): partial-noise regeneration
-# "struggles with high-perturbation watermarks" because a small noise step "retains"
-# watermark information that diffuses back into the output; the fix is to start from
-# clean noise. With the StableDiffusionControlNetImg2ImgPipeline that maps to a high
-# strength (~1.0 = full noise at the first timestep, structure held by the canny
-# ControlNet + DINOv2 IP-Adapter, not by the watermarked latent). So the ctrlregen
-# profile must NOT inherit the SDXL default (`DEFAULT_STRENGTH`, a partial-noise
-# value) -- at that low strength it loads ControlNet + DINOv2-giant and then barely
-# changes the image (a no-op for removal). Tunable via
-# `--strength`; lower it to trade removal strength for fidelity (the CtrlRegen+ regime).
-#
-# EXPERIMENTAL -- NOT recommended for production. The same GPU study that set the 0.3
-# SDXL threshold tested ctrlregen at its clean-noise strength and found it DESTROYS
-# images: smooth/background regions fill with hallucinated micro-text garbage, and it
-# is heavy (~8.5 min / ~$0.30 vs ~25 s / ~$0.02 for SDXL on a large image). The pipeline
-# is effectively binary -- low strength = no-op, high strength = destroys -- with no
-# usable middle, so the literature's "clean-noise is the lever" (arXiv:2410.05470) did
-# NOT survive empirical testing on real content. SDXL img2img at ~0.3 is the shippable
-# path; ctrlregen stays opt-in and flagged experimental.
-CTRLREGEN_DEFAULT_STRENGTH = 1.0
 
+def resolve_strength(strength: float | None, vendor: str | None = None) -> float:
+    """Resolve the denoising strength, applying the vendor default when unset.
 
-def resolve_strength(strength: float | None, profile: str, vendor: str | None = None) -> float:
-    """Resolve the denoising strength, applying the profile/vendor default when unset.
-
-    ``None`` means "the user did not pass ``--strength``". ``ctrlregen`` resolves to
-    ``CTRLREGEN_DEFAULT_STRENGTH`` (clean-noise regeneration). The SDXL default profile
-    resolves **vendor-adaptively**: ``vendor`` (``"openai"`` / ``"google"`` / None, from
+    ``None`` means "the user did not pass ``--strength``", which resolves
+    **vendor-adaptively**: ``vendor`` (``"openai"`` / ``"google"`` / None, from
     ``vendor_for_strength``) selects ``OPENAI_STRENGTH`` / ``GEMINI_STRENGTH`` /
-    ``UNKNOWN_STRENGTH``. An explicit value always wins (including ``0.0`` -- the check is
-    ``is None``, not falsiness). Shared by the CLI (for display) and the engine (for
+    ``UNKNOWN_STRENGTH``. An explicit value always wins (including ``0.0`` -- the check
+    is ``is None``, not falsiness). The ``default`` and ``controlnet`` profiles share
+    the same SDXL base (the ControlNet only preserves structure), so the default does
+    NOT depend on the profile. Shared by the CLI (for display) and the engine (for
     execution) so the two never disagree -- both must pass the SAME ``vendor``.
     """
     if strength is not None:
         return strength
-    if profile == "ctrlregen":
-        return CTRLREGEN_DEFAULT_STRENGTH
     return _VENDOR_STRENGTH.get(vendor or "", UNKNOWN_STRENGTH)
 
 
@@ -107,17 +88,13 @@ def vendor_for_strength(image_path: Path) -> Literal["openai", "google"] | None:
 
 
 def get_model_id_for_profile(profile: str) -> str:
-    """Map CLI model profile names to concrete Hugging Face model IDs."""
+    """Map CLI model profile names to concrete Hugging Face model IDs.
+
+    Both ``default`` and ``controlnet`` use the SDXL base checkpoint -- the canny
+    ControlNet (``CONTROLNET_CANNY_MODEL``) is an add-on loaded on top of it, not a
+    separate base model.
+    """
     normalized = profile.strip().lower()
-    if normalized == "default":
+    if normalized in ("default", "controlnet"):
         return DEFAULT_MODEL_ID
-    if normalized == "ctrlregen":
-        return CTRLREGEN_MODEL_ID
-    raise ValueError(f"Unknown model profile '{profile}'. Use one of: default, ctrlregen.")
-
-
-def detect_model_profile(model_id: str) -> str:
-    """Infer model profile from model identifier."""
-    if "ctrlregen" in model_id.lower():
-        return "ctrlregen"
-    return "default"
+    raise ValueError(f"Unknown model profile '{profile}'. Use one of: default, controlnet.")

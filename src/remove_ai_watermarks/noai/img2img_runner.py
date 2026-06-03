@@ -29,8 +29,14 @@ def run_img2img(
     generator: Any,
     device: str,
     set_progress: Callable[[str], None],
+    extra_kwargs: dict[str, Any] | None = None,
 ) -> Image.Image:
-    """Execute img2img with live progress and return the generated image."""
+    """Execute img2img with live progress and return the generated image.
+
+    ``extra_kwargs`` overlays additional pipeline arguments (e.g. the ControlNet
+    ``control_image`` / ``controlnet_conditioning_scale`` and a non-empty prompt),
+    so a ControlNet img2img pass reuses the same progress + fallback machinery.
+    """
     effective_steps = max(1, int(num_inference_steps * strength))
 
     step_cb, first_step, done_ev, start_updater = make_pipeline_progress(
@@ -42,26 +48,14 @@ def run_img2img(
 
     try:
         result = _call_pipeline(
-            pipeline,
-            image,
-            strength,
-            num_inference_steps,
-            guidance_scale,
-            generator,
-            step_cb,
+            pipeline, image, strength, num_inference_steps, guidance_scale, generator, step_cb, extra_kwargs
         )
         done_ev.set()
         return result.images[0]
     except TypeError:
         first_step.set()
         result = _call_pipeline(
-            pipeline,
-            image,
-            strength,
-            num_inference_steps,
-            guidance_scale,
-            generator,
-            None,
+            pipeline, image, strength, num_inference_steps, guidance_scale, generator, None, extra_kwargs
         )
         done_ev.set()
         return result.images[0]
@@ -81,11 +75,13 @@ def run_img2img_with_mps_fallback(
     set_progress: Callable[[str], None],
     *,
     reload_on_cpu: Callable[[], Any],
+    extra_kwargs: dict[str, Any] | None = None,
 ) -> tuple[Image.Image, str]:
     """Run img2img; on MPS error, fall back to CPU.
 
-    Returns:
-        (result_image, final_device) — device may change to ``"cpu"`` on fallback.
+    ``extra_kwargs`` overlays extra pipeline arguments (used by the ControlNet
+    path). Returns ``(result_image, final_device)`` — device may change to
+    ``"cpu"`` on fallback.
     """
     pipeline = load_pipeline()
 
@@ -99,6 +95,7 @@ def run_img2img_with_mps_fallback(
             generator,
             device,
             set_progress,
+            extra_kwargs,
         )
         return img, device
     except RuntimeError as error:
@@ -108,104 +105,7 @@ def run_img2img_with_mps_fallback(
             _try_clear_mps_cache()
             pipeline = reload_on_cpu()
             img = run_img2img(
-                pipeline,
-                image,
-                strength,
-                num_inference_steps,
-                guidance_scale,
-                None,
-                "cpu",
-                set_progress,
-            )
-            return img, "cpu"
-        raise
-
-
-def run_differential(
-    pipeline: Any,
-    image: Image.Image,
-    change_map: Any,
-    strength: float,
-    num_inference_steps: int,
-    guidance_scale: float,
-    generator: Any,
-    device: str,
-    set_progress: Callable[[str], None],
-) -> Image.Image:
-    """Run the SDXL Differential-Diffusion pipeline and return the image.
-
-    Unlike standard img2img, the differential pipeline needs pre-processed image
-    tensors plus a per-pixel change map (HxW float32 in [0, 1]); white preserves
-    the original pixels, black regenerates them. Runs without a step callback --
-    the community pipeline's callback signature differs across diffusers
-    versions, and a protect-text pass is short.
-    """
-    import torch
-
-    image_tensor = pipeline.image_processor.preprocess(image).to(device)
-    map_tensor = torch.from_numpy(change_map)[None].to(device)  # pyright: ignore[reportPrivateImportUsage, reportUnknownMemberType]
-    set_progress(f"Running protected regeneration ({device}, strength={strength})...")
-    result = pipeline(
-        prompt="",
-        image=image_tensor,
-        original_image=image_tensor,
-        map=map_tensor,
-        strength=strength,
-        num_inference_steps=num_inference_steps,
-        guidance_scale=guidance_scale,
-        generator=generator,
-    )
-    return result.images[0]
-
-
-def run_differential_with_mps_fallback(
-    load_pipeline: Callable[[], Any],
-    image: Image.Image,
-    change_map: Any,
-    strength: float,
-    num_inference_steps: int,
-    guidance_scale: float,
-    generator: Any,
-    device: str,
-    set_progress: Callable[[str], None],
-    *,
-    reload_on_cpu: Callable[[], Any],
-) -> tuple[Image.Image, str]:
-    """Run differential img2img; on MPS error, fall back to CPU.
-
-    Returns:
-        (result_image, final_device) -- device may change to ``"cpu"`` on fallback.
-    """
-    pipeline = load_pipeline()
-    try:
-        img = run_differential(
-            pipeline,
-            image,
-            change_map,
-            strength,
-            num_inference_steps,
-            guidance_scale,
-            generator,
-            device,
-            set_progress,
-        )
-        return img, device
-    except RuntimeError as error:
-        if device == "mps" and is_mps_error(error):
-            logger.warning("MPS error detected: %s. Falling back to CPU.", error)
-            set_progress("MPS error! Clearing cache and retrying on CPU...")
-            _try_clear_mps_cache()
-            pipeline = reload_on_cpu()
-            img = run_differential(
-                pipeline,
-                image,
-                change_map,
-                strength,
-                num_inference_steps,
-                guidance_scale,
-                None,
-                "cpu",
-                set_progress,
+                pipeline, image, strength, num_inference_steps, guidance_scale, None, "cpu", set_progress, extra_kwargs
             )
             return img, "cpu"
         raise
@@ -219,6 +119,7 @@ def _call_pipeline(
     guidance_scale: float,
     generator: Any,
     step_callback: Any,
+    extra_kwargs: dict[str, Any] | None = None,
 ) -> Any:
     kwargs: dict[str, Any] = {
         "prompt": "",
@@ -228,6 +129,8 @@ def _call_pipeline(
         "guidance_scale": guidance_scale,
         "generator": generator,
     }
+    if extra_kwargs:
+        kwargs.update(extra_kwargs)
     if step_callback is not None:
         kwargs["callback"] = step_callback
         kwargs["callback_steps"] = 1

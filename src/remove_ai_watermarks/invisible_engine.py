@@ -7,9 +7,9 @@ This module requires the 'gpu' extra dependencies:
     uv pip install 'remove-ai-watermarks[gpu]'
 """
 
-# cv2/torch boundary: this engine wraps cv2 (resize/imwrite/cvtColor), the YOLO
-# face protector, and the humanizer, none of which carry usable element types;
-# relax the unknown-type rules for this file only.
+# cv2/torch boundary: this engine wraps cv2 (resize/imwrite/cvtColor) and the
+# humanizer, none of which carry usable element types; relax the unknown-type
+# rules for this file only.
 # pyright: reportUnknownMemberType=false, reportUnknownArgumentType=false, reportUnknownVariableType=false, reportUnknownParameterType=false, reportMissingTypeArgument=false, reportMissingTypeStubs=false, reportMissingImports=false, reportArgumentType=false, reportAssignmentType=false, reportReturnType=false, reportCallIssue=false, reportIndexIssue=false, reportOperatorIssue=false, reportOptionalMemberAccess=false, reportOptionalCall=false, reportOptionalSubscript=false, reportOptionalOperand=false, reportAttributeAccessIssue=false, reportPrivateImportUsage=false, reportPrivateUsage=false, reportInvalidTypeForm=false, reportConstantRedefinition=false, reportUnnecessaryComparison=false
 from __future__ import annotations
 
@@ -70,12 +70,9 @@ class InvisibleEngine:
     to break watermark patterns, and reconstructs via reverse diffusion.
     """
 
-    # SDXL base is the default since May 2026; the current Google SynthID is
-    # removed at strength ~0.30 / steps=50 / native res (oracle-verified, n=3 fresh
-    # Gemini -- 0.10/0.15/0.2 still detected). See CLAUDE.md "Known limitations" for
-    # the strength study and the regression evidence ruling out SD-1.5 pipelines.
+    # SDXL base is the default since May 2026; the vendor-adaptive strength
+    # removes the current SynthID (see watermark_profiles + docs/synthid.md).
     DEFAULT_MODEL_ID = "stabilityai/stable-diffusion-xl-base-1.0"
-    CTRLREGEN_MODEL_ID = "yepengliu/ctrlregen"
 
     def __init__(
         self,
@@ -84,31 +81,33 @@ class InvisibleEngine:
         pipeline: str = "default",
         hf_token: str | None = None,
         progress_callback: Callable[[str], None] | None = None,
+        controlnet_conditioning_scale: float = 1.0,
     ) -> None:
         """Initialize the invisible watermark removal engine.
 
         Args:
-            model_id: HuggingFace model ID. None = use default for pipeline.
+            model_id: HuggingFace model ID. None = use the SDXL base default.
             device: Device for inference (auto/cpu/mps/cuda/xpu). None = auto.
-            pipeline: Pipeline profile. "default" (SDXL base, defeats SynthID
-                v2) or "ctrlregen" (CtrlRegen).
+            pipeline: Pipeline profile. "default" (plain SDXL img2img) or
+                "controlnet" (SDXL + canny ControlNet that preserves text/face
+                structure via edge conditioning while removing SynthID).
             hf_token: HuggingFace API token.
             progress_callback: Optional callback for progress messages.
+            controlnet_conditioning_scale: ControlNet structure-preservation
+                strength (controlnet pipeline only).
         """
 
         from remove_ai_watermarks.noai.watermark_remover import WatermarkRemover
 
-        effective_model = model_id
-        if pipeline == "ctrlregen" and model_id is None:
-            effective_model = self.CTRLREGEN_MODEL_ID
-        elif model_id is None:
-            effective_model = self.DEFAULT_MODEL_ID
+        effective_model = model_id or self.DEFAULT_MODEL_ID
 
         self._remover = WatermarkRemover(
             model_id=effective_model,
             device=device,
             progress_callback=progress_callback,
             hf_token=hf_token,
+            pipeline=pipeline,
+            controlnet_conditioning_scale=controlnet_conditioning_scale,
         )
         self._progress_callback = progress_callback
 
@@ -125,8 +124,6 @@ class InvisibleEngine:
         guidance_scale: float | None = None,
         seed: int | None = None,
         humanize: float = 0.0,
-        protect_faces: bool = False,
-        protect_text: bool = False,
         max_resolution: int = 0,
         vendor: str | None = None,
     ) -> Path:
@@ -135,16 +132,12 @@ class InvisibleEngine:
         Args:
             image_path: Path to the watermarked image.
             output_path: Output path (None = overwrite source).
-            strength: Denoising strength (0.0-1.0). None -> profile default
-                (0.10 for SDXL, 1.0 clean-noise for ctrlregen).
+            strength: Denoising strength (0.0-1.0). None -> the vendor-adaptive
+                default.
             steps: Number of denoising steps.
             guidance_scale: Classifier-free guidance scale.
             seed: Random seed for reproducibility.
             humanize: Intensity of Analog Humanizer film grain (0 = off).
-            protect_faces: Boolean to extract and restore faces intact.
-            protect_text: Detect text regions and preserve them via Differential
-                Diffusion when any are found, so glyphs (incl. CJK) survive the
-                removal pass. On by default; the detector decides per image.
             max_resolution: Cap the long side (px) before diffusion. 0 (default)
                 = native resolution, no pre-downscale -- matches the hosted
                 raiw.cc backend. Set a positive value only to bound GPU/MPS
@@ -189,27 +182,6 @@ class InvisibleEngine:
         image_path = _tmp_path
 
         try:
-            # Optional: Face protection (Phase 1 - Extraction)
-            original_faces = []
-            if protect_faces:
-                try:
-                    import cv2
-
-                    from remove_ai_watermarks.face_protector import FaceProtector
-
-                    if self._progress_callback:
-                        self._progress_callback("Detecting and extracting faces (protect-faces)...")
-                    # Convert PIL to CV2 BGR
-                    import numpy as np
-
-                    cv_img = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-                    protector = FaceProtector(use_yolo=True)
-                    original_faces = protector.extract_faces(cv_img)
-                    if self._progress_callback:
-                        self._progress_callback(f"Extracted {len(original_faces)} face(s) for protection.")
-                except Exception as e:
-                    logger.error("Failed to extract faces: %s", e)
-
             out_path = self._remover.remove_watermark(
                 image_path=image_path,
                 output_path=output_path,
@@ -217,14 +189,12 @@ class InvisibleEngine:
                 num_inference_steps=num_inference_steps,
                 guidance_scale=guidance_scale,
                 seed=seed,
-                protect_text=protect_text,
                 vendor=vendor,
             )
 
-            # Optional: Face restoration & Humanizer (Phase 2 - Post-processing)
-            if protect_faces or humanize > 0.0:
+            # Post-processing: optional Humanizer, then restore original resolution.
+            if humanize > 0.0:
                 import cv2
-                import numpy as np
 
                 from remove_ai_watermarks import image_io
 
@@ -232,20 +202,11 @@ class InvisibleEngine:
                 if out_cv is None:
                     return out_path
 
-                if protect_faces and original_faces:
-                    if self._progress_callback:
-                        self._progress_callback("Restoring protected faces with soft blending...")
-                    from remove_ai_watermarks.face_protector import FaceProtector
+                if self._progress_callback:
+                    self._progress_callback(f"Applying Analog Humanizer (grain: {humanize})...")
+                from remove_ai_watermarks.humanizer import apply_analog_humanizer
 
-                    protector = FaceProtector(use_yolo=True)
-                    out_cv = protector.restore_faces(out_cv, original_faces)
-
-                if humanize > 0.0:
-                    if self._progress_callback:
-                        self._progress_callback(f"Applying Analog Humanizer (grain: {humanize})...")
-                    from remove_ai_watermarks.humanizer import apply_analog_humanizer
-
-                    out_cv = apply_analog_humanizer(out_cv, grain_intensity=humanize, chromatic_shift=1)
+                out_cv = apply_analog_humanizer(out_cv, grain_intensity=humanize, chromatic_shift=1)
 
                 # Restore original resolution
                 if (out_cv.shape[1], out_cv.shape[0]) != orig_size:
@@ -259,7 +220,7 @@ class InvisibleEngine:
                 image_io.imwrite(out_path, out_cv)
 
             else:
-                # Even if no protect_faces or humanize, we must restore original size if needed
+                # No humanize: still restore the original size if it was capped.
                 import cv2
 
                 from remove_ai_watermarks import image_io

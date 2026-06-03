@@ -30,9 +30,6 @@ class TestInvisibleEngineInit:
         # SDXL base became the default in May 2026 (defeats SynthID v2).
         assert InvisibleEngine.DEFAULT_MODEL_ID == "stabilityai/stable-diffusion-xl-base-1.0"
 
-    def test_ctrlregen_model_id(self):
-        assert InvisibleEngine.CTRLREGEN_MODEL_ID == "yepengliu/ctrlregen"
-
 
 class TestTargetSize:
     """Regression guard for the native-resolution decision (issues #10 / #15).

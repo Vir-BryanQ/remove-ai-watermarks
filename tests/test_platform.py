@@ -14,12 +14,10 @@ import pytest
 from remove_ai_watermarks.noai.progress import is_mps_error
 from remove_ai_watermarks.noai.utils import get_image_format, is_supported_format
 from remove_ai_watermarks.noai.watermark_profiles import (
-    CTRLREGEN_DEFAULT_STRENGTH,
     DEFAULT_STRENGTH,
     GEMINI_STRENGTH,
     OPENAI_STRENGTH,
     UNKNOWN_STRENGTH,
-    detect_model_profile,
     get_model_id_for_profile,
     resolve_strength,
 )
@@ -114,54 +112,43 @@ class TestModelProfiles:
     def test_default_profile(self):
         assert get_model_id_for_profile("default") == "stabilityai/stable-diffusion-xl-base-1.0"
 
-    def test_ctrlregen_profile(self):
-        assert get_model_id_for_profile("ctrlregen") == "yepengliu/ctrlregen"
+    def test_controlnet_profile(self):
+        # controlnet shares the SDXL base checkpoint (the ControlNet is an add-on).
+        assert get_model_id_for_profile("controlnet") == "stabilityai/stable-diffusion-xl-base-1.0"
 
     def test_unknown_profile_raises(self):
         with pytest.raises(ValueError, match="Unknown model profile"):
             get_model_id_for_profile("nonexistent")
 
-    def test_detect_default(self):
-        assert detect_model_profile("stabilityai/stable-diffusion-xl-base-1.0") == "default"
-
-    def test_detect_ctrlregen(self):
-        assert detect_model_profile("yepengliu/ctrlregen") == "ctrlregen"
-
 
 class TestResolveStrength:
-    """resolve_strength applies the profile/vendor default only when strength is unset."""
+    """resolve_strength applies the vendor default only when strength is unset."""
 
-    def test_none_default_profile_is_vendor_adaptive(self):
-        # No vendor -> unknown default; OpenAI lower, Google == unknown.
-        assert resolve_strength(None, "default") == UNKNOWN_STRENGTH
-        assert resolve_strength(None, "default", "openai") == OPENAI_STRENGTH
-        assert resolve_strength(None, "default", "google") == GEMINI_STRENGTH
-        assert resolve_strength(None, "default", None) == UNKNOWN_STRENGTH
+    def test_none_is_vendor_adaptive(self):
+        # No vendor -> unknown default; OpenAI lower, Google == unknown. The default
+        # is vendor-adaptive and does NOT depend on the pipeline profile (default and
+        # controlnet share the same SDXL base).
+        assert resolve_strength(None) == UNKNOWN_STRENGTH
+        assert resolve_strength(None, "openai") == OPENAI_STRENGTH
+        assert resolve_strength(None, "google") == GEMINI_STRENGTH
+        assert resolve_strength(None, None) == UNKNOWN_STRENGTH
         # An unrecognized vendor string falls through to the unknown default.
-        assert resolve_strength(None, "default", "adobe") == UNKNOWN_STRENGTH
+        assert resolve_strength(None, "adobe") == UNKNOWN_STRENGTH
 
     def test_default_strength_alias_is_unknown_vendor_value(self):
         assert DEFAULT_STRENGTH == UNKNOWN_STRENGTH
         assert OPENAI_STRENGTH < UNKNOWN_STRENGTH
 
-    def test_none_ctrlregen_uses_clean_noise_default(self):
-        # ctrlregen must NOT inherit the SDXL vendor defaults (that makes it a no-op);
-        # clean-noise regeneration is the lever against robust marks. Vendor is ignored.
-        assert resolve_strength(None, "ctrlregen") == CTRLREGEN_DEFAULT_STRENGTH
-        assert resolve_strength(None, "ctrlregen", "openai") == CTRLREGEN_DEFAULT_STRENGTH
-        assert CTRLREGEN_DEFAULT_STRENGTH > DEFAULT_STRENGTH
-
-    def test_explicit_value_overrides_profile_and_vendor(self):
-        assert resolve_strength(0.3, "default") == 0.3
-        assert resolve_strength(0.3, "default", "openai") == 0.3
-        assert resolve_strength(0.3, "ctrlregen") == 0.3
+    def test_explicit_value_overrides_vendor(self):
+        assert resolve_strength(0.3) == 0.3
+        assert resolve_strength(0.3, "openai") == 0.3
 
     def test_explicit_zero_is_respected_not_treated_as_unset(self):
-        # 0.0 is falsy but explicit -- must not fall through to the profile default
+        # 0.0 is falsy but explicit -- must not fall through to the vendor default
         # (the old `strength or DEFAULT` bug would have). Range validation lives in
         # remove_watermark, not here.
-        assert resolve_strength(0.0, "ctrlregen") == 0.0
-        assert resolve_strength(0.0, "default", "google") == 0.0
+        assert resolve_strength(0.0) == 0.0
+        assert resolve_strength(0.0, "google") == 0.0
 
 
 class TestVendorForStrength:

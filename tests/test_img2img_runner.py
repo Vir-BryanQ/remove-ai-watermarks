@@ -15,7 +15,6 @@ import pytest
 
 from remove_ai_watermarks.noai import img2img_runner
 from remove_ai_watermarks.noai.img2img_runner import (
-    run_differential_with_mps_fallback,
     run_img2img,
     run_img2img_with_mps_fallback,
 )
@@ -105,80 +104,6 @@ class TestMpsFallback:
                 None,
                 "cpu",
                 lambda _m: None,
-                reload_on_cpu=reload_on_cpu,
-            )
-        reload_on_cpu.assert_not_called()
-
-
-class TestDifferentialMpsFallback:
-    """The protect-text (Differential Diffusion) path shares the MPS->CPU
-    fallback contract; mock ``run_differential`` so no torch/model is needed."""
-
-    def test_mps_error_reloads_on_cpu_and_retries(self, monkeypatch: pytest.MonkeyPatch):
-        sentinel = object()
-        inner = Mock(side_effect=[RuntimeError(_MPS_OOM), sentinel])
-        monkeypatch.setattr(img2img_runner, "run_differential", inner)
-        reload_on_cpu = Mock(return_value="cpu_pipe")
-
-        img, device = run_differential_with_mps_fallback(
-            load_pipeline=Mock(return_value="gpu_pipe"),
-            image=object(),
-            change_map=object(),
-            strength=0.05,
-            num_inference_steps=50,
-            guidance_scale=7.5,
-            generator="gen",
-            device="mps",
-            set_progress=lambda _m: None,
-            reload_on_cpu=reload_on_cpu,
-        )
-
-        assert (img, device) == (sentinel, "cpu")
-        reload_on_cpu.assert_called_once()
-        assert inner.call_count == 2
-        # Retry uses the reloaded CPU pipeline, device "cpu", and drops the MPS
-        # generator (generator=None) for deterministic CPU execution.
-        retry_args = inner.call_args_list[1].args
-        assert retry_args[0] == "cpu_pipe"
-        assert retry_args[6] is None  # generator
-        assert retry_args[7] == "cpu"  # device
-
-    def test_happy_path_returns_original_device_without_reload(self, monkeypatch: pytest.MonkeyPatch):
-        sentinel = object()
-        monkeypatch.setattr(img2img_runner, "run_differential", Mock(return_value=sentinel))
-        reload_on_cpu = Mock()
-
-        img, device = run_differential_with_mps_fallback(
-            load_pipeline=Mock(return_value="gpu_pipe"),
-            image=object(),
-            change_map=object(),
-            strength=0.05,
-            num_inference_steps=50,
-            guidance_scale=7.5,
-            generator="gen",
-            device="mps",
-            set_progress=lambda _m: None,
-            reload_on_cpu=reload_on_cpu,
-        )
-
-        assert (img, device) == (sentinel, "mps")
-        reload_on_cpu.assert_not_called()
-
-    def test_non_mps_runtime_error_propagates(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setattr(img2img_runner, "run_differential", Mock(side_effect=RuntimeError("CUDA out of memory")))
-        reload_on_cpu = Mock()
-
-        with pytest.raises(RuntimeError, match="CUDA"):
-            run_differential_with_mps_fallback(
-                load_pipeline=Mock(return_value="gpu_pipe"),
-                image=object(),
-                change_map=object(),
-                strength=0.05,
-                num_inference_steps=50,
-                guidance_scale=7.5,
-                generator="gen",
-                device="mps",
-                set_progress=lambda _m: None,
                 reload_on_cpu=reload_on_cpu,
             )
         reload_on_cpu.assert_not_called()
