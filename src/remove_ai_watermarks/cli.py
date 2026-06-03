@@ -147,6 +147,25 @@ _controlnet_scale_option = click.option(
 )
 
 
+def _restore_faces_options(f: Any) -> Any:
+    """Attach the shared GFPGAN face-restoration flags to an invisible-pipeline command."""
+    restore_flag = click.option(
+        "--restore-faces/--no-restore-faces",
+        default=True,
+        help="Restore face identity with a GFPGAN post-pass when faces are present "
+        "(needs the 'restore' extra); on by default, auto-skips when no face is detected "
+        "or the extra is absent.",
+    )
+    weight_flag = click.option(
+        "--restore-faces-weight",
+        type=float,
+        default=0.5,
+        help="GFPGAN fidelity weight (0-1); lower = more GAN regeneration (cleaner "
+        "watermark scrub), higher = closer to the input.",
+    )
+    return restore_flag(weight_flag(f))
+
+
 def _watermark_region(det: DetectionResult, width: int, height: int) -> tuple[int, int, int, int]:
     """Pick a watermark bbox: detector's region if confident, else the default config slot."""
     if det.confidence > 0.15:
@@ -472,6 +491,7 @@ def cmd_erase(
     help="Cap long side (px) before diffusion; 0 = native (best quality, like raiw.cc). Raise only on GPU/MPS OOM.",
 )
 @_controlnet_scale_option
+@_restore_faces_options
 @click.pass_context
 def cmd_invisible(
     ctx: click.Context,
@@ -486,6 +506,8 @@ def cmd_invisible(
     humanize: float,
     max_resolution: int,
     controlnet_scale: float,
+    restore_faces: bool,
+    restore_faces_weight: float,
 ) -> None:
     """Remove invisible AI watermarks (SynthID, StableSignature, TreeRing).
 
@@ -537,6 +559,8 @@ def cmd_invisible(
         humanize=humanize,
         max_resolution=max_resolution,
         vendor=vendor,
+        restore_faces=restore_faces,
+        restore_faces_weight=restore_faces_weight,
     )
     elapsed = time.monotonic() - t0
 
@@ -712,6 +736,7 @@ def cmd_identify(ctx: click.Context, source: Path, no_visible: bool, as_json: bo
     help="Cap long side (px) before diffusion; 0 = native (best quality, like raiw.cc). Raise only on GPU/MPS OOM.",
 )
 @_controlnet_scale_option
+@_restore_faces_options
 @click.pass_context
 def cmd_all(
     ctx: click.Context,
@@ -729,6 +754,8 @@ def cmd_all(
     humanize: float,
     max_resolution: int,
     controlnet_scale: float,
+    restore_faces: bool,
+    restore_faces_weight: float,
 ) -> None:
     """Remove ALL watermarks: visible + invisible + metadata.
 
@@ -826,6 +853,8 @@ def cmd_all(
                 humanize=humanize,
                 max_resolution=max_resolution,
                 vendor=vendor,
+                restore_faces=restore_faces,
+                restore_faces_weight=restore_faces_weight,
             )
             console.print("    Invisible watermark removed")
 
@@ -878,6 +907,8 @@ def _process_batch_image(
     hf_token: str | None,
     humanize: float,
     max_resolution: int = 0,
+    restore_faces: bool = True,
+    restore_faces_weight: float = 0.5,
 ) -> None:
     """Process a single image for batch mode.
 
@@ -938,6 +969,8 @@ def _process_batch_image(
                 seed=seed,
                 humanize=humanize,
                 max_resolution=max_resolution,
+                restore_faces=restore_faces,
+                restore_faces_weight=restore_faces_weight,
                 # Detect the vendor from the pristine original (`img_path`), not the
                 # visible-processed `out_path` whose C2PA is already gone.
                 vendor=vendor_for_strength(img_path),
@@ -995,6 +1028,7 @@ def _process_batch_image(
     default=0,
     help="Cap long side (px) before diffusion; 0 = native (best quality, like raiw.cc). Raise only on GPU/MPS OOM.",
 )
+@_restore_faces_options
 @click.pass_context
 def cmd_batch(
     ctx: click.Context,
@@ -1010,6 +1044,8 @@ def cmd_batch(
     inpaint: bool,
     humanize: float,
     max_resolution: int,
+    restore_faces: bool,
+    restore_faces_weight: float,
 ) -> None:
     """Process all images in a directory."""
     _banner()
@@ -1060,6 +1096,8 @@ def cmd_batch(
                     hf_token=hf_token,
                     humanize=humanize,
                     max_resolution=max_resolution,
+                    restore_faces=restore_faces,
+                    restore_faces_weight=restore_faces_weight,
                 )
                 processed += 1
 

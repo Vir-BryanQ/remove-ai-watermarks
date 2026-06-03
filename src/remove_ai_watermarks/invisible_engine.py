@@ -17,7 +17,7 @@ import logging
 import os
 import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -126,6 +126,8 @@ class InvisibleEngine:
         humanize: float = 0.0,
         max_resolution: int = 0,
         vendor: str | None = None,
+        restore_faces: bool = True,
+        restore_faces_weight: float = 0.5,
     ) -> Path:
         """Remove invisible watermark from an image.
 
@@ -138,6 +140,11 @@ class InvisibleEngine:
             guidance_scale: Classifier-free guidance scale.
             seed: Random seed for reproducibility.
             humanize: Intensity of Analog Humanizer film grain (0 = off).
+            restore_faces: Run the optional GFPGAN face-restoration post-pass when
+                faces are present (needs the ``restore`` extra). Auto-skips with a
+                debug log when the extra is absent or no face is detected.
+            restore_faces_weight: GFPGAN fidelity weight (0-1); lower = more GAN
+                regeneration (cleaner watermark scrub), higher = closer to input.
             max_resolution: Cap the long side (px) before diffusion. 0 (default)
                 = native resolution, no pre-downscale -- matches the hosted
                 raiw.cc backend. Set a positive value only to bound GPU/MPS
@@ -234,11 +241,68 @@ class InvisibleEngine:
                     out_cv = cv2.resize(out_cv, orig_size, interpolation=cv2.INTER_LANCZOS4)
                     image_io.imwrite(out_path, out_cv)
 
+            # Optional GFPGAN face-restoration post-pass: restore face identity that
+            # the diffusion regeneration drifted, while still scrubbing the pixel
+            # watermark (GFPGAN re-synthesizes faces from a StyleGAN2 prior). Runs on
+            # the cleaned output at its final resolution; auto-skips when faces are
+            # absent or the optional extra is not installed.
+            if restore_faces:
+                self._restore_faces(out_path, image, restore_faces_weight)
+
             return out_path
         finally:
             # _tmp_path is always set above (we persist the image unconditionally).
             if _tmp_path.exists():
                 _tmp_path.unlink()
+
+    def _restore_faces(
+        self,
+        out_path: Path,
+        original_image: Any,
+        weight: float,
+    ) -> None:
+        """Run the GFPGAN face-restoration post-pass on the cleaned ``out_path``.
+
+        Composites GFPGAN-restored (identity-preserving, watermark-scrubbed) face
+        regions from the ORIGINAL image into the cleaned output. Best-effort: any
+        failure logs a warning and leaves the un-restored cleaned output in place;
+        a missing ``restore`` extra is logged at debug and skipped (the default-on
+        flag must never error when the extra is absent or no face is present).
+        """
+        from remove_ai_watermarks import face_restore
+
+        if not face_restore.is_available():
+            logger.debug("restore_faces requested but the 'restore' extra is not installed; skipping")
+            return
+
+        try:
+            import cv2
+            import numpy as np
+
+            from remove_ai_watermarks import image_io
+
+            cleaned_bgr = image_io.imread(out_path, cv2.IMREAD_COLOR)
+            if cleaned_bgr is None:
+                logger.warning("restore_faces: could not read cleaned output %s; skipping", out_path)
+                return
+
+            # Original (EXIF-transposed) as BGR, aligned to the cleaned image so the
+            # GFPGAN face boxes land in the cleaned image's coordinate space. The
+            # cleaned output is already restored to the original resolution above, so
+            # this resize is normally a no-op (it only fires if a max-resolution cap
+            # left the source PIL image smaller).
+            original_rgb = original_image.convert("RGB")
+            original_bgr = cv2.cvtColor(np.array(original_rgb), cv2.COLOR_RGB2BGR)
+            cleaned_size = (cleaned_bgr.shape[1], cleaned_bgr.shape[0])
+            if (original_bgr.shape[1], original_bgr.shape[0]) != cleaned_size:
+                original_bgr = cv2.resize(original_bgr, cleaned_size, interpolation=cv2.INTER_LANCZOS4)
+
+            if self._progress_callback:
+                self._progress_callback("Restoring face identity (GFPGAN post-pass)...")
+            restored = face_restore.restore_faces(original_bgr, cleaned_bgr, weight=weight)
+            image_io.imwrite(out_path, restored)
+        except Exception as e:
+            logger.warning("restore_faces post-pass failed (%s); keeping un-restored output", e)
 
     def remove_watermark_batch(
         self,

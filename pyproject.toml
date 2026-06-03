@@ -76,6 +76,22 @@ lama = [
     "onnxruntime>=1.16.0",
     "huggingface-hub>=0.20.0",
 ]
+# Optional GFPGAN face-restoration post-pass (commercial-safe Apache-2.0 GFPGAN +
+# MIT RetinaFace). Re-synthesizes each face from a StyleGAN2 prior after the
+# diffusion removal pass, so it restores identity while still scrubbing the pixel
+# watermark. The GFPGANv1.4 weights + RetinaFace detector download on first use;
+# they are never bundled. gfpgan/basicsr/facexlib are an OLD ecosystem and must
+# stay on numpy < 2.0 to match the pinned gpu diffusion stack -- scipy is capped
+# < 1.18 (>= 1.18 uses np.long, gone in numpy 1.24-1.26) and numba < 0.60 to keep
+# the whole env on one numpy 1.26 resolution (same trap class as the removed
+# faceid/insightface extra). Kept OUT of `all` (heavy + model download).
+restore = [
+    "gfpgan>=1.3.8",
+    "facexlib>=0.3.0",
+    "basicsr>=1.4.2",
+    "scipy<1.18",
+    "numba<0.60",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-cov>=4.1.0",
@@ -91,6 +107,14 @@ all = ["remove-ai-watermarks[gpu,detect,trustmark,lama,dev]"]
 # stable safetensors pin (or once safetensors 0.8.0 stable is out).
 [tool.uv]
 prerelease = "allow"
+
+# basicsr 1.4.2 (pulled by the `restore` GFPGAN extra) ships sdist-only and its
+# setup.py get_version() reads basicsr/version.py in a way that newer setuptools
+# (>= 69) breaks with ``KeyError: '__version__'`` under isolated PEP 517 builds.
+# Pin an old setuptools as its build dependency so the sdist builds; this is
+# scoped to basicsr and does not affect the rest of the resolution.
+[tool.uv.extra-build-dependencies]
+basicsr = ["setuptools<69"]
 
 # PyTorch Intel-GPU (XPU) wheel index. ``explicit = true`` keeps it inert for
 # the default CPU/CUDA install: uv consults it only when a torch install

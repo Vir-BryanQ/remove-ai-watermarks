@@ -23,7 +23,7 @@ If this tool saves you time, consider [sponsoring its development](https://githu
 - **AI metadata stripping** — EXIF, PNG text chunks, C2PA provenance manifests (PNG / JPEG / AVIF / HEIF / JPEG-XL, **MP4 / MOV / M4V / M4A** at the container level, and **WebM / MP3 / WAV / FLAC / OGG** losslessly via ffmpeg), XMP DigitalSourceType
 - **"Made with AI" label removal** — removes the AI-disclosure metadata that platforms read to apply automatic labels (useful for clearing a false-positive label from a human-edited photograph)
 - **Analog Humanizer** — optional film grain and chromatic aberration post-processing
-- **Text and face preservation** — optional `--pipeline controlnet` adds a canny ControlNet that keeps text and face structure sharp through the removal pass (without copying original pixels, so SynthID is still removed). Note: canny preserves face *structure*, not *identity* (the regenerated face drifts in likeness); preserving identity is a separate face-restoration post-pass, researched but not yet shipped
+- **Text and face preservation** — optional `--pipeline controlnet` adds a canny ControlNet that keeps text and face structure sharp through the removal pass (without copying original pixels, so SynthID is still removed). Canny preserves face *structure*, not *identity* (the regenerated face drifts in likeness); identity is preserved by the `--restore-faces` GFPGAN post-pass (on by default, auto when faces present)
 - **Batch processing** — process entire directories
 - **Detection** — three-stage NCC watermark detection with confidence scoring
 - **Provenance detection (`identify`)** — aggregate C2PA issuer, the C2PA soft-binding forensic-watermark vendor (Adobe TrustMark, Digimarc, Imatag, ...), IPTC "Made with AI" plus the IPTC 2025.1 `AISystemUsed` field, embedded SD/ComfyUI params, EXIF/XMP generator tags, the xAI/Grok EXIF signature, the China TC260 AIGC label (XMP, PNG chunk, or EXIF), the HuggingFace `hf-job-id` job marker, the SynthID metadata proxy, the visible marks (Gemini sparkle plus the Doubao "豆包AI生成" / Jimeng "即梦AI" text marks), the open SD/SDXL/FLUX invisible watermark, and (with the `trustmark` extra) the open Adobe TrustMark watermark into one origin-platform + watermark-inventory verdict (`--json` for machine output)
@@ -119,7 +119,7 @@ image → encode to latent space (VAE) at native resolution
 >
 > **`--pipeline controlnet` preserves text and face structure.** It runs the same SDXL img2img scrub but adds a canny ControlNet that conditions the regeneration on the image's edge map, so text and structure stay sharp at the strengths that remove SynthID. The watermark removal still comes from the img2img regeneration (`--strength`); the ControlNet only preserves structure — no original pixels are copied or frozen, so SynthID does not survive. `--controlnet-scale` tunes the preservation strength (higher = closer to the original structure). Runs fp32 on mps/cpu (fp16 only on cuda/xpu, where the fp16-fixed SDXL VAE is loaded automatically).
 >
-> **Face identity is not preserved yet.** Canny preserves where a face is, but not who it is — the regenerated face drifts in likeness. (An IP-Adapter FaceID approach was tried and removed: it needs high denoise strength and corrupts faces at the low strength used for removal.) The validated direction is a separate face-restoration post-pass (CodeFormer/GFPGAN at a low fidelity weight, run after the removal pass — it re-synthesizes each face from a codebook, so it scrubs the watermark while holding identity) — researched and prototyped (see `docs/controlnet-removal-pipeline-research.md`) but not yet shipped.
+> **`--restore-faces` preserves face identity (GFPGAN, on by default).** Canny preserves where a face is, but not who it is — the regenerated face drifts in likeness. The `--restore-faces` post-pass (on by default; needs the `restore` extra) fixes this: after the removal pass it runs GFPGAN on the original faces and composites the restored face regions into the cleaned image. GFPGAN re-synthesizes each face from a StyleGAN2 prior, so those pixels are GAN-generated (not copied) — the watermark is still scrubbed in the face regions while identity is held (oracle-confirmed clean). It auto-skips when no face is detected or the extra is absent. Tune fidelity with `--restore-faces-weight` (default `0.5`; lower = more regeneration / cleaner scrub, higher = closer to the input). Commercial-safe (GFPGAN is Apache-2.0, its RetinaFace detector MIT); the CodeFormer alternative is non-commercial and is not shipped. (An IP-Adapter FaceID approach was tried earlier and removed: it needs high denoise strength and corrupts faces at the low strength used for removal.)
 
 SDXL is the default since May 2026: empirically defeats SynthID v2 on Gemini 3 Pro outputs, where the older SD-1.5 pipeline at 768 px did not. The SD-1.5 path was removed once it was verified not to handle v2. Note the scope: this defeats the SynthID *verifier*, which is not the same as being forensically indistinguishable from a real photo. Recent work ([arXiv:2605.09203](https://arxiv.org/abs/2605.09203)) shows watermark-removal pipelines leave detectable traces, so a separate "this image was processed" classifier can still flag the output.
 
@@ -127,7 +127,7 @@ SDXL is the default since May 2026: empirically defeats SynthID v2 on Gemini 3 P
 
 > **Technical deep-dive:** see [`docs/synthid.md`](docs/synthid.md) for a primary-source-cited breakdown of how SynthID works mechanically (post-hoc encoder/decoder, 136-bit payload, pixel-space embedding), what it empirically survives (JPEG, crop, resize: ~99.98% TPR at 0.1% FPR from arXiv:2510.09263), what removes it, and the forensic-stealth tradeoff (all known removal attacks are detectable at >98% TPR@1%FPR per arXiv:2605.09203).
 
-**Text and face preservation** (opt-in `--pipeline controlnet`): adds a canny ControlNet so text and face *structure* stay sharp through the removal pass, without copying or freezing any original pixels (so SynthID is still removed). Tune the preservation strength with `--controlnet-scale`. Canny preserves structure but not face *identity* (preserving identity is a future face-restoration post-pass, not yet shipped — see the callout above).
+**Text and face preservation** (opt-in `--pipeline controlnet`): adds a canny ControlNet so text and face *structure* stay sharp through the removal pass, without copying or freezing any original pixels (so SynthID is still removed). Tune the preservation strength with `--controlnet-scale`. Canny preserves structure but not face *identity* (identity is preserved by the `--restore-faces` GFPGAN post-pass, on by default — see the callout above).
 
 **Analog Humanizer**: optional film grain and chromatic aberration injection that mimics a photo of a screen, raising the bar for AI-generated image classifiers. (It frustrates generic classifiers but does not guarantee forensic invisibility — see the [arXiv:2605.09203](https://arxiv.org/abs/2605.09203) note above.)
 
@@ -203,6 +203,15 @@ After installation the `remove-ai-watermarks` command is available system-wide.
 >
 > ```bash
 > pip install -e ".[trustmark]"   # or: uv pip install -e ".[trustmark]"
+> ```
+>
+> To preserve face identity after invisible removal (the `--restore-faces`
+> GFPGAN post-pass, on by default), install the `restore` extra. The GFPGANv1.4
+> and RetinaFace weights download on first use. It needs Python < 3.13 (basicsr
+> does not build on 3.13):
+>
+> ```bash
+> pip install -e ".[restore]"   # or: uv pip install -e ".[restore]"
 > ```
 
 #### Invisible watermark removal

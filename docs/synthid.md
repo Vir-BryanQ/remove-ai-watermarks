@@ -384,12 +384,15 @@ conditioning, never by copying original pixels.**
   while every pixel is still regenerated -- SynthID is removed everywhere. Verified
   better than plain img2img at the same strength (text stays legible where plain
   garbles it), and the controlnet background scrub reads clean on the oracle.
-- **Face identity:** canny holds face *structure* but not *identity*. The validated
-  approach (researched + prototyped 2026-06-03, not yet shipped) is a face-restoration
-  post-pass: CodeFormer/GFPGAN RE-SYNTHESIZES each face from a discrete codebook
-  (codebook pixels, not original -> scrubs SynthID) at a low fidelity weight
-  (`w~0.5`), composited into the cleaned image. Oracle-confirmed clean in face
-  regions with identity preserved. (An IP-Adapter FaceID approach was tried and
+- **Face identity:** canny holds face *structure* but not *identity*. Shipped as the
+  optional `--restore-faces` GFPGAN post-pass (`face_restore.py`, the `restore`
+  extra, ON by default, auto when faces present). It runs GFPGAN on the ORIGINAL
+  faces and feather-composites the restored face REGIONS into the cleaned image:
+  GFPGAN RE-SYNTHESIZES each face from a StyleGAN2 prior (GAN pixels, not original
+  -> scrubs SynthID) at a low fidelity weight (`--restore-faces-weight`, default
+  `0.5`). Oracle-confirmed clean in face regions with identity preserved. Commercial-
+  safe (GFPGAN Apache-2.0 + RetinaFace MIT); the CodeFormer alternative is
+  NON-COMMERCIAL and is not shipped. (An IP-Adapter FaceID approach was tried and
   REMOVED -- it needs high denoise strength and corrupts faces at removal strength;
   see `docs/controlnet-removal-pipeline-research.md`.)
 
