@@ -94,14 +94,36 @@ raising strength cannot fix it — the face is re-pasted from the original after
 This also corrects the prior "GFPGAN scrubs SynthID / oracle-confirmed clean" claim (it was
 checked on one lucky image).
 
+### Certified controlnet strength floors (Modal GPU sweep + oracle, 2026-06-04)
+
+Run via the isolated `raiw-controlnet-cert` Modal app (`raiw-app/modal_cert.py`):
+controlnet, `restore_faces` OFF (it re-introduces SynthID), `--max-resolution 1536`,
+each image checked on ITS OWN vendor oracle (OpenAI -> openai.com/verify, Gemini -> the
+Gemini app; the two payloads are vendor-specific and never cross-checked):
+
+| vendor | **floor** | evidence (oracle, restore OFF, <= 1536) |
+|---|---|---|
+| **OpenAI** | **0.20** | 2 photoreal images (9-face grid + bracelet) x seed {1,2,3} = **6/6 clean**; the bracelet that FLIPPED at 0.15 is seed-robust at 0.20 |
+| **Gemini** | **0.30** | hardest face (gemini_3): 0.20 detected -> 0.30 clean on **2/2 seeds**; Gemini is the harder vendor (default 0.15 vs OpenAI 0.10) AND resolution-sensitive |
+
+- **OpenAI 0.20 transfers to prod as-is** (OpenAI removal is resolution-independent:
+  the study clears it at 0.05 across 1024-1600).
+- **Gemini 0.30 is the floor at <= 1536 only.** Gemini is resolution-sensitive (study:
+  native 2816 likely needs >= 0.30 even on `default`), and **raiw.cc runs NATIVE**
+  (`max_resolution=0` in `modal_app.py`). So either CAP Gemini to <= 1536 in raiw.cc and
+  use 0.30, or run a native-resolution Gemini cert and expect a higher floor (~0.35+).
+
 ### Recommendations for a removal pipeline (raiw.cc)
 
 - **Treat controlnet as PRESERVATION, not removal.** Choose it for text/structure content,
   `default` for photoreal; removal efficacy comes from STRENGTH in both.
 - **Give controlnet a higher, per-vendor strength than `default`** (today both share
-  `resolve_strength` 0.10/0.15, tuned for plain img2img). Oracle floors so far: OpenAI
-  ~0.20 with margin, Gemini ~0.20–0.25. Calibrate on the GPU worker with a seed-repeat
-  sweep (cheap there), not single local runs.
+  `resolve_strength` 0.10/0.15, tuned for plain img2img). **Certified controlnet floors:
+  OpenAI 0.20, Gemini 0.30** (see table above) — add a controlnet-specific per-vendor
+  schedule to `resolve_strength` rather than reusing the `default` ladder.
+- **Fix the seed in prod.** The non-determinism is purely `seed=None` (random); a fixed
+  `--seed` makes every run reproduce the certified-clean result, so you ship a
+  deterministic, re-certifiable config (and the seed sweep collapses to one config).
 - **Rework `--restore-faces` before any removal use:** run GFPGAN on the diffusion-CLEANED
   image (not the original), or drop the weight well below 0.5, or leave it off — then
   re-validate on the oracle.

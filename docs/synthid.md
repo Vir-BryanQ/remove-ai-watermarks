@@ -556,11 +556,22 @@ openai.com/verify):
   robust to downscaling by design, and the study's resolution trend says LOWER
   processing res needs LESS strength, so 1024 was never the wall.)
 
+**Certified controlnet floors (Modal GPU sweep `raiw-app/modal_cert.py` + oracle,
+restore OFF, <= 1536, each vendor on its own oracle):** OpenAI **0.20** (2 photoreal x
+seed {1,2,3} = 6/6 clean; the 0.15-flipper is seed-robust at 0.20) and Gemini **0.30**
+(0.20 detected -> 0.30 clean on 2/2 seeds). OpenAI 0.20 transfers to prod
+(resolution-independent); Gemini 0.30 holds only <= 1536 -- Gemini is
+resolution-sensitive and raiw.cc runs NATIVE, so cap Gemini <= 1536 + use 0.30 or
+native-calibrate (~0.35+). See `docs/controlnet-removal-pipeline-research.md` for the
+table.
+
 **Net for raiw.cc:** (1) controlnet needs a higher, per-vendor strength than
-`default` (OpenAI ~0.20, Gemini >= ~0.20-0.25), oracle-calibrated; (2) the
+`default` -- CERTIFIED OpenAI 0.20 / Gemini 0.30 (above); add a controlnet-specific
+schedule to `resolve_strength`, do not reuse the default ladder; (2) the
 `--restore-faces` pass can re-add SynthID and must be reworked (restore on the
 cleaned image / lower weight / off) before it is safe in a removal pipeline; (3)
-removal near threshold is seed-non-deterministic, so use margin.
+removal near threshold is seed-non-deterministic -> FIX the prod seed (kills the
+coin-flip; ship a deterministic certified config).
 
 ---
 
