@@ -18,7 +18,11 @@ from typing import TYPE_CHECKING, Any, Literal
 import click
 
 from remove_ai_watermarks import __version__, watermark_registry
-from remove_ai_watermarks.noai.watermark_profiles import resolve_strength, vendor_for_strength
+from remove_ai_watermarks.noai.watermark_profiles import (
+    resolve_strength,
+    strength_default_help,
+    vendor_for_strength,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -143,8 +147,8 @@ _controlnet_scale_option = click.option(
     "--controlnet-scale",
     type=float,
     default=1.0,
-    help="ControlNet conditioning scale (structure/text preservation strength), controlnet pipeline "
-    "only (EXPERIMENTAL).",
+    help="ControlNet conditioning scale (structure/text preservation strength); "
+    "applies to the controlnet pipeline (the default). Higher = closer to original structure.",
 )
 
 _min_resolution_option = click.option(
@@ -173,48 +177,103 @@ _auto_option = click.option(
     "--auto",
     is_flag=True,
     default=False,
-    help="Auto-pick the pipeline and adaptive polish from image content. "
-    "Every choice is overridable -- an explicit --pipeline / --adaptive-polish "
-    "always wins. EXPERIMENTAL.",
+    help="DEPRECATED: controlnet is already the default pipeline, so --auto now only "
+    "enables --adaptive-polish (the content detectors were removed). Use "
+    "--adaptive-polish instead.",
 )
 
 _adaptive_polish_option = click.option(
     "--adaptive-polish/--no-adaptive-polish",
-    default=False,
+    default=True,
     help="Restore the input's detail level after removal (capped unsharp + edge-masked grain "
-    "targeting the input's sharpness, sparing text). On by default under --auto; pass "
-    "--no-adaptive-polish to disable it there, or --adaptive-polish to use it without --auto. "
-    "Independent of the fixed --unsharp/--humanize. EXPERIMENTAL.",
+    "targeting the input's sharpness, sparing text), countering the over-smoothed look. ON by "
+    "default; it self-limits where there is no detail deficit (text/flat graphics), so it is a "
+    "no-op there. Pass --no-adaptive-polish to disable. Independent of --unsharp/--humanize.",
+)
+
+# HuggingFace model + CFG knobs, shared by the diffusion commands (invisible/all/batch)
+# so the surface stays identical across them.
+_model_option = click.option(
+    "--model",
+    type=str,
+    default=None,
+    help="HuggingFace model ID for the diffusion pipeline. Default: the SDXL base checkpoint.",
+)
+_guidance_scale_option = click.option(
+    "--guidance-scale",
+    type=float,
+    default=None,
+    help="Classifier-free guidance scale (CFG). Default: 7.5 (the library default). "
+    "Lower = follow the prompt less / stay closer to the input.",
 )
 
 
-def _apply_auto(
-    ctx: click.Context,
-    source: Path,
-    pipeline: str,
-    adaptive_polish: bool,
-) -> tuple[str, bool]:
-    """Resolve ``--auto``: plan the three content-adaptive modes (pipeline, face
-    restore, adaptive polish) from the image, overriding only the ones the user left
-    at their default (an explicit flag always wins). The fixed ``--unsharp``/
-    ``--humanize`` filters are independent and untouched. Prints the chosen plan.
+def _normalize_pipeline(ctx: click.Context, param: click.Parameter, value: str | None) -> str | None:
+    """Resolve the legacy ``default`` profile name to ``sdxl`` (click option callback).
+
+    Emits a one-line deprecation notice when the user explicitly passes the outdated
+    ``default`` value, pointing at the two current choices (``sdxl`` / ``controlnet``).
     """
-    from remove_ai_watermarks import auto_config
+    if value is None:
+        return None
+    from remove_ai_watermarks.noai.watermark_profiles import normalize_profile
 
-    cfg = auto_config.plan(source)
-    if cfg is None:
-        console.print("  Auto: could not read image; using defaults")
-        return pipeline, adaptive_polish
+    normalized = normalize_profile(value)
+    if value.strip().lower() == "default":
+        click.echo(
+            "Warning: --pipeline default is deprecated and maps to 'sdxl'. "
+            "Use --pipeline sdxl (plain SDXL) or --pipeline controlnet (the default).",
+            err=True,
+        )
+    return normalized
 
-    def _is_default(name: str) -> bool:
-        return ctx.get_parameter_source(name) == click.core.ParameterSource.DEFAULT
 
-    if _is_default("pipeline"):
-        pipeline = cfg.pipeline
-    if _is_default("adaptive_polish"):
-        adaptive_polish = cfg.adaptive_polish
-    console.print(f"  Auto: {cfg.reason}")
-    return pipeline, adaptive_polish
+# ``controlnet`` (the default-SELECTED value) and ``sdxl`` (plain SDXL img2img) are the
+# two current profiles; ``default`` is an OUTDATED back-compat alias for ``sdxl``
+# (warned + normalized away by _normalize_pipeline).
+_PIPELINE_CHOICES = ["sdxl", "controlnet", "default"]
+_PIPELINE_HELP = (
+    "Pipeline profile. controlnet (DEFAULT) = SDXL + canny ControlNet that preserves "
+    "text/faces via edge conditioning while removing SynthID; sdxl = plain SDXL img2img "
+    "(lighter, no extra model download, but leaves SynthID on flat-graphic content). "
+    "('default' is an OUTDATED alias for 'sdxl' -- use sdxl or controlnet.)"
+)
+
+# Shared --pipeline / --strength decorators so the three diffusion commands
+# (invisible/all/batch) keep an identical surface and the strength help can never
+# drift from the watermark_profiles constants (strength_default_help derives it).
+_pipeline_option = click.option(
+    "--pipeline",
+    type=click.Choice(_PIPELINE_CHOICES),
+    default="controlnet",
+    callback=_normalize_pipeline,
+    help=_PIPELINE_HELP,
+)
+_strength_option = click.option(
+    "--strength",
+    type=float,
+    default=None,
+    help=f"Denoising strength (0.0-1.0). Default: {strength_default_help()}.",
+)
+
+
+def _resolve_auto_polish(auto: bool, adaptive_polish: bool) -> bool:
+    """Warn on the retired ``--auto`` flag, returning ``adaptive_polish`` unchanged.
+
+    ``--auto`` used to plan the pipeline + polish from content detection, but the
+    pipeline is now always controlnet (the default) and the adaptive polish is ON by
+    default (it self-gates by detail level), so the content detectors were removed and
+    ``--auto`` is now a no-op alias: the polish it used to enable is already the default,
+    and an explicit ``--no-adaptive-polish`` still wins. So it only emits a deprecation
+    warning and passes ``adaptive_polish`` through.
+    """
+    if auto:
+        click.echo(
+            "Warning: --auto is deprecated and now does nothing (the adaptive polish it "
+            "enabled is ON by default). Use --no-adaptive-polish to turn the polish off.",
+            err=True,
+        )
+    return adaptive_polish
 
 
 def _warn_if_esrgan_unavailable(upscaler: str) -> None:
@@ -524,21 +583,9 @@ def cmd_erase(
 @click.option(
     "-o", "--output", type=click.Path(path_type=Path), default=None, help="Output path (default: <source>_clean.<ext>)."
 )
-@click.option(
-    "--strength",
-    type=float,
-    default=None,
-    help="Denoising strength (0.0-1.0). Default: vendor-adaptive (OpenAI 0.10 / Google 0.15 / "
-    "unknown 0.15, from the C2PA issuer).",
-)
+@_strength_option
 @click.option("--steps", type=int, default=50, help="Number of denoising steps. Default: 50.")
-@click.option(
-    "--pipeline",
-    type=click.Choice(["default", "controlnet"]),
-    default="default",
-    help="Pipeline profile (default=SDXL img2img; controlnet=SDXL + canny ControlNet that preserves "
-    "text/faces via edge conditioning while removing SynthID, EXPERIMENTAL).",
-)
+@_pipeline_option
 @click.option(
     "--device",
     type=click.Choice(["auto", "cpu", "mps", "cuda", "xpu"]),
@@ -560,6 +607,8 @@ def cmd_erase(
 @_min_resolution_option
 @_unsharp_option
 @_upscaler_option
+@_model_option
+@_guidance_scale_option
 @_auto_option
 @_adaptive_polish_option
 @click.pass_context
@@ -579,6 +628,8 @@ def cmd_invisible(
     min_resolution: int,
     controlnet_scale: float,
     upscaler: str,
+    model: str | None,
+    guidance_scale: float | None,
     auto: bool,
     adaptive_polish: bool,
 ) -> None:
@@ -599,8 +650,7 @@ def cmd_invisible(
 
     source = _validate_image(source)
     _warn_if_esrgan_unavailable(upscaler)
-    if auto:
-        pipeline, adaptive_polish = _apply_auto(ctx, source, pipeline, adaptive_polish)
+    adaptive_polish = _resolve_auto_polish(auto, adaptive_polish)
     if output is None:
         output = source.with_stem(source.stem + "_clean")
 
@@ -610,6 +660,7 @@ def cmd_invisible(
         console.print(f"  {msg}")
 
     engine = InvisibleEngine(
+        model_id=model,
         device=device_str,
         pipeline=pipeline,
         hf_token=hf_token,
@@ -630,7 +681,7 @@ def cmd_invisible(
         output_path=output,
         strength=strength,
         num_inference_steps=steps,
-        guidance_scale=None,
+        guidance_scale=guidance_scale,
         seed=seed,
         humanize=humanize,
         unsharp=unsharp,
@@ -781,21 +832,10 @@ def cmd_identify(ctx: click.Context, source: Path, no_visible: bool, as_json: bo
 @click.option(
     "--inpaint-method", type=click.Choice(["ns", "telea", "gaussian"]), default="ns", help="Inpainting method."
 )
-@click.option(
-    "--strength",
-    type=float,
-    default=None,
-    help="Invisible watermark denoising strength. Default: vendor-adaptive (OpenAI 0.10 / Google 0.15 / unknown 0.15).",
-)
+@_strength_option
 @click.option("--steps", type=int, default=50, help="Number of denoising steps for invisible removal.")
-@click.option(
-    "--pipeline",
-    type=click.Choice(["default", "controlnet"]),
-    default="default",
-    help="Pipeline profile (default=SDXL img2img; controlnet=SDXL + canny ControlNet that preserves "
-    "text/faces via edge conditioning while removing SynthID, EXPERIMENTAL).",
-)
-@click.option("--model", type=str, default=None, help="HuggingFace model ID for invisible removal.")
+@_pipeline_option
+@_model_option
 @click.option(
     "--device",
     type=click.Choice(["auto", "cpu", "mps", "cuda", "xpu"]),
@@ -817,6 +857,7 @@ def cmd_identify(ctx: click.Context, source: Path, no_visible: bool, as_json: bo
 @_min_resolution_option
 @_unsharp_option
 @_upscaler_option
+@_guidance_scale_option
 @_auto_option
 @_adaptive_polish_option
 @click.pass_context
@@ -839,6 +880,7 @@ def cmd_all(
     min_resolution: int,
     controlnet_scale: float,
     upscaler: str,
+    guidance_scale: float | None,
     auto: bool,
     adaptive_polish: bool,
 ) -> None:
@@ -856,8 +898,7 @@ def cmd_all(
     _banner()
     source = _validate_image(source)
     _warn_if_esrgan_unavailable(upscaler)
-    if auto:
-        pipeline, adaptive_polish = _apply_auto(ctx, source, pipeline, adaptive_polish)
+    adaptive_polish = _resolve_auto_polish(auto, adaptive_polish)
 
     if output is None:
         output = source.with_stem(source.stem + "_clean")
@@ -937,6 +978,7 @@ def cmd_all(
                 output_path=tmp_path,
                 strength=strength,
                 num_inference_steps=steps,
+                guidance_scale=guidance_scale,
                 seed=seed,
                 humanize=humanize,
                 unsharp=unsharp,
@@ -1001,7 +1043,8 @@ def _process_batch_image(
     min_resolution: int = 1024,
     controlnet_scale: float = 1.0,
     upscaler: str = "lanczos",
-    auto: bool = False,
+    model: str | None = None,
+    guidance_scale: float | None = None,
     adaptive_polish: bool = False,
 ) -> None:
     """Process a single image for batch mode.
@@ -1048,14 +1091,12 @@ def _process_batch_image(
         if invisible_available():
             from remove_ai_watermarks.invisible_engine import InvisibleEngine
 
-            # --auto re-plans the pipeline / face-restore / polish per image; only the
-            # pipeline choice changes the engine ctor, so cache one engine per pipeline
-            # (controlnet vs default) rather than a single shared instance.
-            if auto:
-                pipeline, adaptive_polish = _apply_auto(ctx, img_path, pipeline, adaptive_polish)
+            # Cache the engine in ctx.obj so the batch builds it once (pipeline is a
+            # single CLI value, constant across the run).
             engines = ctx.obj.setdefault("_inv_engines", {})
             if pipeline not in engines:
                 engines[pipeline] = InvisibleEngine(
+                    model_id=model,
                     device=None if device == "auto" else device,
                     pipeline=pipeline,
                     hf_token=hf_token,
@@ -1067,6 +1108,7 @@ def _process_batch_image(
                 out_path,
                 strength=strength,
                 num_inference_steps=steps,
+                guidance_scale=guidance_scale,
                 seed=seed,
                 humanize=humanize,
                 unsharp=unsharp,
@@ -1104,19 +1146,13 @@ def _process_batch_image(
 @click.option(
     "--mode", type=click.Choice(["visible", "invisible", "metadata", "all"]), default="visible", help="Processing mode."
 )
-@click.option("--strength", type=float, default=None, help="Denoising strength (invisible mode).")
+@_strength_option
 @click.option("--steps", type=int, default=50, help="Number of denoising steps (invisible mode).")
 @click.option("--inpaint/--no-inpaint", default=True, help="Apply inpainting (visible mode).")
 @click.option(
     "--humanize", type=float, default=0.0, help="Analog Humanizer film grain intensity (0 = off, typical: 2.0-6.0)."
 )
-@click.option(
-    "--pipeline",
-    type=click.Choice(["default", "controlnet"]),
-    default="default",
-    help="Pipeline profile (default=SDXL img2img; controlnet=SDXL + canny ControlNet that preserves "
-    "text/faces via edge conditioning while removing SynthID, EXPERIMENTAL).",
-)
+@_pipeline_option
 @click.option(
     "--device",
     type=click.Choice(["auto", "cpu", "mps", "cuda", "xpu"]),
@@ -1135,6 +1171,8 @@ def _process_batch_image(
 @_unsharp_option
 @_upscaler_option
 @_controlnet_scale_option
+@_model_option
+@_guidance_scale_option
 @_auto_option
 @_adaptive_polish_option
 @click.pass_context
@@ -1156,6 +1194,8 @@ def cmd_batch(
     min_resolution: int,
     controlnet_scale: float,
     upscaler: str,
+    model: str | None,
+    guidance_scale: float | None,
     auto: bool,
     adaptive_polish: bool,
 ) -> None:
@@ -1177,6 +1217,7 @@ def cmd_batch(
     console.print(f"  Mode: {mode}")
     if mode in ("invisible", "all"):
         _warn_if_esrgan_unavailable(upscaler)
+    adaptive_polish = _resolve_auto_polish(auto, adaptive_polish)
 
     processed = 0
     errors = 0
@@ -1214,7 +1255,8 @@ def cmd_batch(
                     min_resolution=min_resolution,
                     controlnet_scale=controlnet_scale,
                     upscaler=upscaler,
-                    auto=auto,
+                    model=model,
+                    guidance_scale=guidance_scale,
                     adaptive_polish=adaptive_polish,
                 )
                 processed += 1

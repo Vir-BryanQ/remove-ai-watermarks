@@ -89,7 +89,7 @@ class InvisibleEngine:
         self,
         model_id: str | None = None,
         device: str | None = None,
-        pipeline: str = "default",
+        pipeline: str = "controlnet",
         hf_token: str | None = None,
         progress_callback: Callable[[str], None] | None = None,
         controlnet_conditioning_scale: float = 1.0,
@@ -99,9 +99,10 @@ class InvisibleEngine:
         Args:
             model_id: HuggingFace model ID. None = use the SDXL base default.
             device: Device for inference (auto/cpu/mps/cuda/xpu). None = auto.
-            pipeline: Pipeline profile. "default" (plain SDXL img2img) or
-                "controlnet" (SDXL + canny ControlNet that preserves text/face
-                structure via edge conditioning while removing SynthID).
+            pipeline: Pipeline profile. "controlnet" (DEFAULT; SDXL + canny ControlNet
+                that preserves text/face structure via edge conditioning while removing
+                SynthID) or "sdxl" (plain SDXL img2img, lighter but leaves SynthID on
+                flat-graphic content). "default" is a back-compat alias for "sdxl".
             hf_token: HuggingFace API token.
             progress_callback: Optional callback for progress messages.
             controlnet_conditioning_scale: ControlNet structure-preservation
@@ -182,12 +183,11 @@ class InvisibleEngine:
             unsharp: Final unsharp-mask sharpening strength (0 = off, default).
                 Applied last to counter the soft / over-smoothed look of the
                 diffusion pass; ~0.5-0.8 is a safe range, higher risks edge halos.
-            adaptive_polish: When True (the --auto mode default), restore the input's
-                detail level in the softened output instead of fixed unsharp/humanize:
-                a capped unsharp + edge-masked grain targeting the input's Laplacian
-                variance (self-limiting on text/graphics). Runs LAST, after face
-                restoration. The fixed ``humanize``/``unsharp`` knobs are normally 0
-                when this is on.
+            adaptive_polish: When True (the CLI default), restore the input's detail
+                level in the softened output: a capped unsharp + edge-masked grain
+                targeting the input's Laplacian variance. Self-limiting -- a no-op when
+                the output already meets the input's detail level (text/flat graphics),
+                so it only acts on over-smoothed photo/face texture. Runs LAST.
             max_resolution: Cap the long side (px) before diffusion. 0 (default)
                 = no cap. Set a positive value only to bound GPU/MPS memory on
                 very large inputs (it reintroduces a lossy downscale->upscale
@@ -316,8 +316,8 @@ class InvisibleEngine:
                         self._progress_callback(f"Sharpening (unsharp mask: {unsharp})...")
                     image_io.imwrite(out_path, unsharp_mask(out_cv, amount=unsharp))
 
-            # Adaptive polish (--auto): restore the input's detail level in the softened
-            # output, sparing text/edges. Replaces the fixed unsharp/humanize knobs.
+            # Adaptive polish (CLI default): restore the input's detail level in the
+            # softened output, sparing text/edges. Self-limiting where there is no deficit.
             if adaptive_polish:
                 import cv2
                 import numpy as np

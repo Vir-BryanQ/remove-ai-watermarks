@@ -21,7 +21,9 @@ from remove_ai_watermarks.noai.watermark_profiles import (
     OPENAI_STRENGTH,
     UNKNOWN_STRENGTH,
     get_model_id_for_profile,
+    normalize_profile,
     resolve_strength,
+    strength_default_help,
 )
 from remove_ai_watermarks.noai.watermark_remover import get_device, is_watermark_removal_available
 
@@ -111,8 +113,14 @@ class TestMpsErrorDetection:
 class TestModelProfiles:
     """Tests for watermark_profiles.py."""
 
-    def test_default_profile(self):
+    def test_sdxl_profile(self):
+        assert get_model_id_for_profile("sdxl") == "stabilityai/stable-diffusion-xl-base-1.0"
+
+    def test_default_alias_resolves_to_sdxl(self):
+        # "default" is the legacy alias for "sdxl" (back-compat for existing scripts).
         assert get_model_id_for_profile("default") == "stabilityai/stable-diffusion-xl-base-1.0"
+        assert normalize_profile("default") == "sdxl"
+        assert normalize_profile("controlnet") == "controlnet"
 
     def test_controlnet_profile(self):
         # controlnet shares the SDXL base checkpoint (the ControlNet is an add-on).
@@ -127,9 +135,9 @@ class TestResolveStrength:
     """resolve_strength applies the vendor default only when strength is unset."""
 
     def test_none_is_vendor_adaptive(self):
-        # No vendor -> unknown default; OpenAI lower, Google == unknown. The default
-        # is vendor-adaptive and does NOT depend on the pipeline profile (default and
-        # controlnet share the same SDXL base).
+        # No vendor -> unknown default; OpenAI lower, Google == unknown. The SAME ladder
+        # applies to both pipelines (the certified controlnet floors), so there is no
+        # pipeline argument.
         assert resolve_strength(None) == UNKNOWN_STRENGTH
         assert resolve_strength(None, "openai") == OPENAI_STRENGTH
         assert resolve_strength(None, "google") == GEMINI_STRENGTH
@@ -137,9 +145,24 @@ class TestResolveStrength:
         # An unrecognized vendor string falls through to the unknown default.
         assert resolve_strength(None, "adobe") == UNKNOWN_STRENGTH
 
+    def test_ladder_is_the_certified_controlnet_floors(self):
+        # The unified ladder == the oracle-certified controlnet floors (OpenAI 0.20,
+        # Google/unknown 0.30); Google is the more-robust watermark, so it is higher.
+        assert OPENAI_STRENGTH == 0.20
+        assert GEMINI_STRENGTH == 0.30
+        assert UNKNOWN_STRENGTH == 0.30
+        assert OPENAI_STRENGTH < GEMINI_STRENGTH
+
     def test_default_strength_alias_is_unknown_vendor_value(self):
         assert DEFAULT_STRENGTH == UNKNOWN_STRENGTH
         assert OPENAI_STRENGTH < UNKNOWN_STRENGTH
+
+    def test_strength_default_help_derives_from_constants(self):
+        # The CLI --strength help is built from this, so it can never drift from the ladder.
+        h = strength_default_help()
+        assert str(OPENAI_STRENGTH) in h
+        assert str(GEMINI_STRENGTH) in h
+        assert str(UNKNOWN_STRENGTH) in h
 
     def test_explicit_value_overrides_vendor(self):
         assert resolve_strength(0.3) == 0.3

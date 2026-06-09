@@ -23,7 +23,7 @@ If this tool saves you time, consider [sponsoring its development](https://githu
 - **AI metadata stripping** — EXIF, PNG text chunks, C2PA provenance manifests (PNG / JPEG / AVIF / HEIF / JPEG-XL, **MP4 / MOV / M4V / M4A** at the container level, and **WebM / MP3 / WAV / FLAC / OGG** losslessly via ffmpeg), XMP DigitalSourceType
 - **"Made with AI" label removal** — removes the AI-disclosure metadata that platforms read to apply automatic labels (useful for clearing a false-positive label from a human-edited photograph)
 - **Analog Humanizer** — optional film grain and chromatic aberration post-processing
-- **Text and face preservation (experimental)** — optional `--pipeline controlnet` adds a canny ControlNet that keeps text and face structure sharp through the removal pass (without copying original pixels, so SynthID is still removed). Canny preserves face *structure*, not *identity* (the regenerated face drifts in likeness). The library does not ship a face-restore extra: every approach evaluated (GFPGAN-on-cleaned, PhotoMaker-V2, InstantID txt2img, InstantID img2img-on-cleaned) regenerated the face via SDXL and made the output look more AI-generated than the cleaned image. The cleaned controlnet output is the least-AI face state achievable without re-introducing SynthID.
+- **Text and face preservation (default)** — the default pipeline is a canny ControlNet that keeps text and face structure sharp through the removal pass (without copying original pixels, so SynthID is still removed). Use `--pipeline sdxl` for plain SDXL img2img (lighter, no extra model download) on inputs without text or faces. Canny preserves face *structure*, not *identity* (the regenerated face drifts in likeness). The library does not ship a face-restore extra: every approach evaluated (GFPGAN-on-cleaned, PhotoMaker-V2, InstantID txt2img, InstantID img2img-on-cleaned) regenerated the face via SDXL and made the output look more AI-generated than the cleaned image. The cleaned controlnet output is the least-AI face state achievable without re-introducing SynthID.
 - **Batch processing** — process entire directories
 - **Detection** — three-stage NCC watermark detection with confidence scoring
 - **Provenance detection (`identify`)** — aggregate C2PA issuer, the C2PA soft-binding forensic-watermark vendor (Adobe TrustMark, Digimarc, Imatag, ...), IPTC "Made with AI" plus the IPTC 2025.1 `AISystemUsed` field, embedded SD/ComfyUI params, EXIF/XMP generator tags, the xAI/Grok EXIF signature, the China TC260 AIGC label (XMP, PNG chunk, or EXIF), the HuggingFace `hf-job-id` job marker, the SynthID metadata proxy, the visible marks (Gemini sparkle plus the Doubao "豆包AI生成" / Jimeng "即梦AI" / Samsung Galaxy AI "Contenuti generati dall'AI" text marks), the open SD/SDXL/FLUX invisible watermark, and (with the `trustmark` extra) the open Adobe TrustMark watermark into one origin-platform + watermark-inventory verdict (`--json` for machine output)
@@ -118,15 +118,16 @@ The removal pipeline (default profile, SDXL):
 image → encode to latent space (VAE) at native resolution
       → add controlled noise (forward diffusion)
       → denoise (reverse diffusion, ~50 steps; strength is vendor-adaptive:
-        0.10 OpenAI / 0.15 Google / 0.15 unknown, override with --strength)
+        0.20 OpenAI / 0.30 Google / 0.30 unknown, same for both pipelines;
+        override with --strength)
       → decode back to pixels (VAE)
 ```
 
 - Large inputs run at native resolution (no down-then-up round-trip, which was the main quality loss in issue #10); use `--max-resolution N` only to cap GPU/MPS memory on very large inputs. Small inputs (long side under 1024 px) are auto-upscaled to a 1024 px floor before diffusion, because SDXL distorts on a tiny latent, and the result is restored to the original size (a transparent quality boost). Disable the floor with `--min-resolution 0`. The floor upscale uses Lanczos by default; `--upscaler esrgan` (the `esrgan` extra) runs Real-ESRGAN first for sharper detail and falls back to Lanczos if the extra is absent. ESRGAN is a generic photo/texture GAN with no face/glyph prior, so it is best for photo/texture content -- it can degrade faces (the diffusion pass regenerates them, so the final recovers) and thin text; keep Lanczos for text-heavy inputs.
 
-> **Default strength is vendor-adaptive (no flag needed).** The tool reads the C2PA issuer to detect which vendor's SynthID is present and picks the strength that clears it with the least quality loss: **OpenAI gpt-image → `0.10`**, **Google Gemini → `0.15`**, **unknown source → `0.15`**. An oracle-verified June 2026 study (clean pipeline, per-image openai.com/verify or Gemini app) found OpenAI's watermark clears at `0.05` across `1024`-`1600` px (resolution-independent) while Google's is ~3x more robust and needs `0.15`. The dominant factor is the vendor, not resolution. There is no local SynthID detector, so if the oracle still reads SynthID, raise `--strength`; if you care more about preserving fine text, lower it. (Caveat: Google's `0.15` was validated on the capped `--max-resolution 1536` path; a very large native Gemini image may need more.)
+> **Default strength is vendor-adaptive (no flag needed).** The tool reads the C2PA issuer to detect which vendor's SynthID is present and picks the strength accordingly: **OpenAI gpt-image → `0.20`**, **Google Gemini → `0.30`**, **unknown source → `0.30`**. The **same ladder applies to both pipelines** — these are the oracle-certified `controlnet` floors (June 2026 Modal cert, multi-seed). They also cover plain `sdxl`: the two pipelines have opposite hard cases (controlnet leaves SynthID on photoreal, sdxl on flat graphics), but on its own hard case sdxl is the weaker remover, so it needs at least controlnet's strength — using one certified ladder is the safe choice (margin-based for sdxl, not separately certified). The dominant factor is the vendor (Google's SynthID is ~3x more robust). There is no local SynthID detector, so if the oracle still reads SynthID, raise `--strength`; if you care more about preserving fine detail, lower it. (Caveat: Google's `0.30` was validated only at `--max-resolution 1536`; a very large native Gemini image may need ~`0.35`+.)
 >
-> **`--pipeline controlnet` preserves text and face structure (experimental, opt-in).** It runs the same SDXL img2img scrub but adds a canny ControlNet that conditions the regeneration on the image's edge map, so text and structure stay sharp at the strengths that remove SynthID. The watermark removal still comes from the img2img regeneration (`--strength`); the ControlNet only preserves structure — no original pixels are copied or frozen, so SynthID does not survive. `--controlnet-scale` tunes the preservation strength (higher = closer to the original structure). Runs fp32 on mps/cpu (fp16 only on cuda/xpu, where the fp16-fixed SDXL VAE is loaded automatically).
+> **The default pipeline is `controlnet` — it preserves text and face structure.** It runs the same SDXL img2img scrub but adds a canny ControlNet that conditions the regeneration on the image's edge map, so text and structure stay sharp at the strengths that remove SynthID. The watermark removal still comes from the img2img regeneration (`--strength`); the ControlNet only preserves structure — no original pixels are copied or frozen. The default strength ladder (OpenAI `0.20` / Google `0.30`) is the oracle-certified controlnet floor. `--controlnet-scale` tunes the preservation strength (higher = closer to the original structure). Runs fp32 on mps/cpu (fp16 only on cuda/xpu, where the fp16-fixed SDXL VAE is loaded automatically). Pass `--pipeline sdxl` for plain SDXL img2img (lighter, no extra model download) on inputs without text or faces.
 >
 > **No face-restore extra in the library.** Every ArcFace-based regeneration approach we evaluated (GFPGAN-on-cleaned, PhotoMaker-V2, InstantID txt2img, InstantID img2img-on-cleaned at three parameter sweeps, 2026-06-04 - 2026-06-08 Modal cert sweeps) regenerated the face via SDXL diffusion — the output face pixels were diffusion-fresh (SynthID not re-introduced), but the face inherently looked more AI-generated than the cleaned image (SDXL "clean skin" gloss, lost original identity precision). The cleaned image from the main controlnet 0.20 pass is the least-AI face state we can reach without re-introducing SynthID. Empirical conclusion in `docs/synthid-robust-identity-research-2026-06-08.md`.
 
@@ -136,7 +137,7 @@ SDXL is the default since May 2026: empirically defeats SynthID v2 on Gemini 3 P
 
 > **Technical deep-dive:** see [`docs/synthid.md`](docs/synthid.md) for a primary-source-cited breakdown of how SynthID works mechanically (post-hoc encoder/decoder, 136-bit payload, pixel-space embedding), what it empirically survives (JPEG, crop, resize: ~99.98% TPR at 0.1% FPR from arXiv:2510.09263), what removes it, and the forensic-stealth tradeoff (all known removal attacks are detectable at >98% TPR@1%FPR per arXiv:2605.09203).
 
-**Text and face preservation** (experimental, opt-in `--pipeline controlnet`): adds a canny ControlNet so text and face *structure* stay sharp through the removal pass, without copying or freezing any original pixels (so SynthID is still removed). Tune the preservation strength with `--controlnet-scale`. Canny preserves structure but not face *identity*: the regenerated face drifts in likeness. The library does not ship a face-restore extra (see the callout above).
+**Text and face preservation** (the default pipeline; `--pipeline sdxl` opts down to plain SDXL): a canny ControlNet keeps text and face *structure* sharp through the removal pass, without copying or freezing any original pixels (so SynthID is still removed). Tune the preservation strength with `--controlnet-scale`. Canny preserves structure but not face *identity*: the regenerated face drifts in likeness. The library does not ship a face-restore extra (see the callout above).
 
 **Analog Humanizer**: optional film grain and chromatic aberration injection that mimics a photo of a screen, raising the bar for AI-generated image classifiers. (It frustrates generic classifiers but does not guarantee forensic invisibility — see the [arXiv:2605.09203](https://arxiv.org/abs/2605.09203) note above.)
 
@@ -292,14 +293,15 @@ remove-ai-watermarks invisible image.png -o clean.png --humanize 4.0 --unsharp 0
 # first (disable with --min-resolution 0); --upscaler esrgan uses Real-ESRGAN for
 # that floor upscale (needs the 'esrgan' extra). On a very large image that OOMs the
 # GPU/MPS, cap the long side: --max-resolution 2048
-# Strength is vendor-adaptive by default (OpenAI 0.10 / Google 0.15); override
-# with --strength. To preserve text/face structure, use --pipeline controlnet
-# Or let it choose: --auto picks the pipeline and an adaptive polish
-# from the image content (controlnet when there is text/structure, polish that
-# restores the input's detail level while sparing text). Every choice is
-# overridable: --pipeline and --no-adaptive-polish win over the auto pick.
-# Experimental.
-# (SDXL + canny ControlNet); tune preservation with --controlnet-scale. Add
+# Strength is vendor-adaptive by default (OpenAI 0.20 / Google 0.30, same
+# for both pipelines); override with --strength. controlnet (text/face
+# structure preservation) is the default pipeline; --pipeline sdxl opts down
+# to plain SDXL for non-structure inputs. Tune structure preservation with
+# --controlnet-scale, the CFG with --guidance-scale (default 7.5), and the
+# diffusion model with --model (default: SDXL base).
+# --adaptive-polish (ON by default) restores the input's detail level (sparing
+# text) to counter the over-smoothed look; it self-limits to a no-op where
+# there is no detail deficit. Disable with --no-adaptive-polish.
 
 # Check / strip AI metadata (C2PA, EXIF, "Made with AI" labels)
 # --check also flags SynthID-bearing sources: a C2PA manifest signed by
@@ -312,9 +314,9 @@ remove-ai-watermarks metadata image.png --remove
 # Batch with a specific mode
 remove-ai-watermarks batch ./images/ --mode visible
 
-# Batch also accepts --auto (and --adaptive-polish): the plan is recomputed per
-# image, so a mixed directory routes each file to the right pipeline
-remove-ai-watermarks batch ./images/ --mode all --auto
+# Batch accepts the full invisible knob set (--strength/--guidance-scale/--model/
+# --pipeline/...); --adaptive-polish is on by default (--no-adaptive-polish to disable)
+remove-ai-watermarks batch ./images/ --mode all
 ```
 
 ### Python API
@@ -333,6 +335,30 @@ print(f"Detected: {result.detected} (confidence: {result.confidence:.1%})")
 # Remove
 clean = engine.remove_watermark(image)
 cv2.imwrite("clean.png", clean)
+```
+
+#### Invisible removal (diffusion)
+
+```python
+from pathlib import Path
+from remove_ai_watermarks.invisible_engine import InvisibleEngine
+
+# pipeline: "controlnet" (default, preserves text/face structure) or "sdxl" (plain).
+# model_id=None uses the SDXL base; controlnet_conditioning_scale tunes preservation.
+engine = InvisibleEngine(pipeline="controlnet")
+
+engine.remove_watermark(
+    Path("watermarked.png"),
+    Path("clean.png"),
+    strength=None,          # None = vendor-adaptive default (OpenAI 0.20 / Google 0.30)
+    num_inference_steps=50,
+    guidance_scale=None,    # None = the library default (7.5)
+    seed=None,              # set for reproducible output
+    adaptive_polish=True,   # detail-targeted polish, self-gating (default on in the CLI)
+    min_resolution=1024,    # upscale tiny inputs to this floor before diffusion
+    max_resolution=0,       # 0 = native; set only to cap GPU/MPS memory
+    upscaler="lanczos",     # or "esrgan" for the floor upscale (needs the 'esrgan' extra)
+)
 ```
 
 ### Metadata stripping

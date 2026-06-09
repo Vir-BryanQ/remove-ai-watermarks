@@ -277,6 +277,72 @@ class TestInvisibleCommand:
         expected = sample_png.with_stem(sample_png.stem + "_clean")
         assert expected.exists()
 
+    def test_invisible_adaptive_polish_on_by_default(self, runner, sample_png):
+        mock_cls, mock_engine = _mock_invisible_engine()
+        with (
+            patch("remove_ai_watermarks.invisible_engine.is_available", return_value=True),
+            patch("remove_ai_watermarks.cli.InvisibleEngine", mock_cls, create=True),
+            patch("remove_ai_watermarks.invisible_engine.InvisibleEngine", mock_cls),
+        ):
+            result = runner.invoke(main, ["invisible", str(sample_png)])
+        assert result.exit_code == 0, result.output
+        # adaptive_polish is ON by default (self-gating, so a no-op where not needed).
+        assert mock_engine.remove_watermark.call_args.kwargs["adaptive_polish"] is True
+        # Default model is None (the SDXL base) and CFG is None (the library's 7.5).
+        assert mock_cls.call_args.kwargs["model_id"] is None
+        assert mock_engine.remove_watermark.call_args.kwargs["guidance_scale"] is None
+
+    def test_invisible_no_adaptive_polish_disables(self, runner, sample_png):
+        mock_cls, mock_engine = _mock_invisible_engine()
+        with (
+            patch("remove_ai_watermarks.invisible_engine.is_available", return_value=True),
+            patch("remove_ai_watermarks.cli.InvisibleEngine", mock_cls, create=True),
+            patch("remove_ai_watermarks.invisible_engine.InvisibleEngine", mock_cls),
+        ):
+            result = runner.invoke(main, ["invisible", str(sample_png), "--no-adaptive-polish"])
+        assert result.exit_code == 0, result.output
+        assert mock_engine.remove_watermark.call_args.kwargs["adaptive_polish"] is False
+
+    def test_invisible_model_and_guidance_scale_flow_to_engine(self, runner, sample_png):
+        mock_cls, mock_engine = _mock_invisible_engine()
+        with (
+            patch("remove_ai_watermarks.invisible_engine.is_available", return_value=True),
+            patch("remove_ai_watermarks.cli.InvisibleEngine", mock_cls, create=True),
+            patch("remove_ai_watermarks.invisible_engine.InvisibleEngine", mock_cls),
+        ):
+            result = runner.invoke(
+                main,
+                ["invisible", str(sample_png), "--model", "org/custom-sdxl", "--guidance-scale", "5.5"],
+            )
+        assert result.exit_code == 0, result.output
+        assert mock_cls.call_args.kwargs["model_id"] == "org/custom-sdxl"
+        assert mock_engine.remove_watermark.call_args.kwargs["guidance_scale"] == 5.5
+
+    def test_pipeline_default_alias_warns_and_maps_to_sdxl(self, runner, sample_png):
+        mock_cls, _mock_engine = _mock_invisible_engine()
+        with (
+            patch("remove_ai_watermarks.invisible_engine.is_available", return_value=True),
+            patch("remove_ai_watermarks.cli.InvisibleEngine", mock_cls, create=True),
+            patch("remove_ai_watermarks.invisible_engine.InvisibleEngine", mock_cls),
+        ):
+            result = runner.invoke(main, ["invisible", str(sample_png), "--pipeline", "default"])
+        assert result.exit_code == 0, result.output
+        # The legacy value warns and is normalized to "sdxl" before the engine is built.
+        assert "deprecated" in result.output.lower()
+        assert mock_cls.call_args.kwargs["pipeline"] == "sdxl"
+
+    def test_pipeline_sdxl_does_not_warn(self, runner, sample_png):
+        mock_cls, _mock_engine = _mock_invisible_engine()
+        with (
+            patch("remove_ai_watermarks.invisible_engine.is_available", return_value=True),
+            patch("remove_ai_watermarks.cli.InvisibleEngine", mock_cls, create=True),
+            patch("remove_ai_watermarks.invisible_engine.InvisibleEngine", mock_cls),
+        ):
+            result = runner.invoke(main, ["invisible", str(sample_png), "--pipeline", "sdxl"])
+        assert result.exit_code == 0, result.output
+        assert "deprecated" not in result.output.lower()
+        assert mock_cls.call_args.kwargs["pipeline"] == "sdxl"
+
     def test_invisible_nonexistent_file(self, runner):
         result = runner.invoke(main, ["invisible", "/nonexistent/file.png"])
         assert result.exit_code != 0
@@ -514,32 +580,17 @@ class TestBatchCommand:
         assert out[0, 0, 3] == 0
         assert out[100, 100, 3] == 255
 
-    def test_batch_auto_plans_pipeline_per_image(self, runner, tmp_path):
-        """--auto in batch re-plans the pipeline/restore/polish per image and
-        builds one engine per resolved pipeline."""
-        from remove_ai_watermarks import auto_config
-
+    def test_batch_auto_is_deprecated_and_enables_polish(self, runner, tmp_path):
+        """--auto is retired: it warns and just enables the adaptive polish (the
+        pipeline is always the default controlnet now)."""
         input_dir = _make_batch_dir(tmp_path, count=2)
         output_dir = tmp_path / "output"
-        plan = auto_config.AutoConfig(
-            pipeline="controlnet",
-            adaptive_polish=True,
-            unsharp=0.0,
-            humanize=0.0,
-            min_resolution=1024,
-            has_face=True,
-            has_text=False,
-            edge_density=0.05,
-            width=200,
-            height=200,
-        )
         mock_cls, mock_engine = _mock_invisible_engine()
         with (
             patch("remove_ai_watermarks.cli.InvisibleEngine", mock_cls, create=True),
             patch("remove_ai_watermarks.invisible_engine.InvisibleEngine", mock_cls),
             patch("remove_ai_watermarks.cli.invisible_available", return_value=True, create=True),
             patch("remove_ai_watermarks.invisible_engine.is_available", return_value=True),
-            patch("remove_ai_watermarks.auto_config.plan", return_value=plan),
         ):
             result = runner.invoke(
                 main,
@@ -547,9 +598,9 @@ class TestBatchCommand:
             )
         assert result.exit_code == 0, result.output
         assert "2 processed" in result.output
-        # Engine built with the auto-resolved controlnet pipeline.
+        assert "deprecated" in result.output.lower()
+        # Pipeline stays the default controlnet; --auto only turned the polish on.
         assert mock_cls.call_args.kwargs["pipeline"] == "controlnet"
-        # The auto plan's adaptive polish reached the engine call.
         assert mock_engine.remove_watermark.call_args.kwargs["adaptive_polish"] is True
 
     def test_batch_default_output_dir(self, runner, tmp_path):
