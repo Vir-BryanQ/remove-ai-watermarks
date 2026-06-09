@@ -367,7 +367,7 @@ def restore_faces_instantid(
 
     restored: list[tuple[NDArray[Any], tuple[int, int, int, int]]] = []
     for box in boxes:
-        id_crop_bgr, square_box = _face_crop_square(original_bgr, box)
+        id_crop_bgr, _square_box = _face_crop_square(original_bgr, box)
         if id_crop_bgr.size == 0:
             continue
 
@@ -405,8 +405,102 @@ def restore_faces_instantid(
         )
         gen_rgb = out.images[0]
         gen_bgr = cv2.cvtColor(np.array(gen_rgb), cv2.COLOR_RGB2BGR)
-        restored.append((gen_bgr, square_box))
+
+        # Multi-face anti-patchwork: each gen_bgr is a fresh 1024x1024 SCENE with a
+        # face in it. Compositing the whole 1024 frame into the original face's
+        # square_box pulls regenerated BACKGROUND pixels into the cleaned image
+        # (different backgrounds per face -> patchwork on group photos). Detect
+        # where the face actually landed in gen_bgr, crop tightly to it, and place
+        # it at the ORIGINAL face bbox (not the 2x square_box). The composite then
+        # only touches face pixels and the background of the cleaned canvas is
+        # preserved.
+        gen_face_infos = face_analyser.get(gen_bgr)
+        if gen_face_infos:
+            gf = max(
+                gen_face_infos,
+                key=lambda x: (x["bbox"][2] - x["bbox"][0]) * (x["bbox"][3] - x["bbox"][1]),
+            )
+            gx1, gy1, gx2, gy2 = (int(v) for v in gf["bbox"])
+            gw, gh = gx2 - gx1, gy2 - gy1
+            gcx, gcy = gx1 + gw // 2, gy1 + gh // 2
+            # Match the input crop padding (pad=0.5 default of _face_crop_square,
+            # which gives a side of ~2x the face size).
+            side = int(max(gw, gh) * 2.0)
+            half = side // 2
+            cx1 = max(0, gcx - half)
+            cy1 = max(0, gcy - half)
+            cx2 = min(gen_bgr.shape[1], gcx + half)
+            cy2 = min(gen_bgr.shape[0], gcy + half)
+            face_crop = gen_bgr[cy1:cy2, cx1:cx2]
+        else:
+            # Fallback: use the whole 1024 frame (matches the pre-2026-06-08 path).
+            logger.debug("instantid_restore: no face found in generated image; using full frame")
+            face_crop = gen_bgr
+
+        # Composite the tight face crop into a target box centered on the ORIGINAL
+        # face bbox, same pad as the input crop so the face fills its natural slot.
+        x, y, bw, bh = box
+        target_side = int(max(bw, bh) * 2.0)
+        thalf = target_side // 2
+        tcx, tcy = x + bw // 2, y + bh // 2
+        h_c, w_c = cleaned_bgr.shape[:2]
+        tx1 = max(0, tcx - thalf)
+        ty1 = max(0, tcy - thalf)
+        tx2 = min(w_c, tcx + thalf)
+        ty2 = min(h_c, tcy + thalf)
+
+        restored.append((face_crop, (tx1, ty1, tx2, ty2)))
 
     if not restored:
         return cleaned_bgr
-    return _composite_faces(cleaned_bgr, restored)
+    return _composite_faces_elliptical(cleaned_bgr, restored)
+
+
+def _composite_faces_elliptical(
+    base_bgr: NDArray[Any],
+    restored_crops: list[tuple[NDArray[Any], tuple[int, int, int, int]]],
+    feather_div: int = 8,
+) -> NDArray[Any]:
+    """Composite face crops into ``base_bgr`` using an elliptical, feathered alpha.
+
+    Unlike ``photomaker_restore._composite_faces`` which feathers a RECTANGULAR
+    alpha over the whole crop bbox, this builds an ELLIPSE inscribed in each
+    bbox and feathers the ellipse edge. The bbox corners (which carry
+    regenerated-scene background pixels) fade to zero so the cleaned-image
+    background stays intact, eliminating multi-face patchwork on group photos.
+    The ellipse covers roughly the head silhouette which is what we want to
+    replace; everything outside it -- hair edges, shoulders, scene context --
+    stays from the cleaned canvas.
+    """
+    import cv2
+    import numpy as np
+
+    out = base_bgr.astype(np.float32)
+    h_b, w_b = base_bgr.shape[:2]
+
+    for crop, (x1, y1, x2, y2) in restored_crops:
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w_b, x2), min(h_b, y2)
+        bw, bh = x2 - x1, y2 - y1
+        if bw <= 0 or bh <= 0:
+            continue
+        resized = cv2.resize(crop, (bw, bh), interpolation=cv2.INTER_LANCZOS4)
+
+        # Elliptical alpha inscribed in the bbox (axes slightly inside so the
+        # feather edge tapers cleanly inside the rectangle), feathered with a
+        # Gaussian sized by the shorter side.
+        alpha_crop = np.zeros((bh, bw), dtype=np.float32)
+        center = (bw // 2, bh // 2)
+        axes = (max(1, int(bw * 0.45)), max(1, int(bh * 0.55)))
+        cv2.ellipse(alpha_crop, center, axes, 0, 0, 360, 1.0, -1)
+        k = max(3, (min(bw, bh) // feather_div) | 1)
+        alpha_crop = cv2.GaussianBlur(alpha_crop, (k, k), 0)
+
+        alpha_full = np.zeros((h_b, w_b), dtype=np.float32)
+        alpha_full[y1:y2, x1:x2] = alpha_crop
+        full_restored = np.zeros_like(out)
+        full_restored[y1:y2, x1:x2] = resized
+        a = alpha_full[:, :, None]
+        out = full_restored * a + out * (1.0 - a)
+
+    return np.clip(out, 0, 255).astype(np.uint8)
