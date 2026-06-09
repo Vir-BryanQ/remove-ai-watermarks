@@ -436,4 +436,4 @@ Legitimate uses — publishing your own work, privacy (stripping metadata that l
 
 ## License
 
-MIT
+[Apache 2.0](LICENSE). Copyright 2025-2026 wiltodelta.
