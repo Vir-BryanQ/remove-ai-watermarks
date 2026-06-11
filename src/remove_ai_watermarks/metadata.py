@@ -343,13 +343,16 @@ def aigc_label(image_path: Path) -> dict[str, str] | None:
       found by a container-agnostic raw-byte scan (PNG/JPEG/WebP alike); and
     - a raw-JSON ``{"AIGC":{...}}`` block with no namespace, as embedded in JPEG
       EXIF (UserComment) by some China-served generators, brace-matched from the
-      scan head.
+      scan head; and
+    - a bare ``AIGC{...}`` blob (the label glued straight to its JSON, no
+      ``"AIGC":`` key wrapper) embedded in a JPEG APP segment near the JFIF
+      header by some China-served generators.
 
     Returns the decoded JSON (e.g. ``{"Label": "1", "ContentProducer": ...}``)
-    or None. The generic forms (the PNG-chunk key ``AIGC`` and the bare
-    ``{"AIGC":...}`` object) are accepted only if they carry at least one known
-    TC260 field (``_TC260_FIELDS``); the namespaced XMP element is unambiguous,
-    so any JSON object is accepted.
+    or None. The generic forms (the PNG-chunk key ``AIGC``, the bare
+    ``{"AIGC":...}`` object, and the bare ``AIGC{...}`` blob) are accepted only
+    if they carry at least one known TC260 field (``_TC260_FIELDS``); the
+    namespaced XMP element is unambiguous, so any JSON object is accepted.
     """
     import html
     import json
@@ -393,22 +396,74 @@ def aigc_label(image_path: Path) -> dict[str, str] | None:
         body = match.group(1) if match.group(1) is not None else match.group(2)
         return _parse(html.unescape(body.decode("utf-8", "replace")), require_tc260_field=False)
 
-    # Raw-JSON {"AIGC":{...}} block (no namespace), as written into JPEG EXIF
-    # (UserComment) by some China-served generators -- the PNG-chunk and XMP
-    # paths above both miss it. The bytes pre-check keeps the common (no-AIGC)
-    # path off the full-buffer decode; raw_decode then brace-matches the inner
-    # object (respecting nested braces / quoted strings) and `_parse` applies the
-    # same dict coercion + TC260-field gate as the generic PNG-chunk path.
-    if b'"AIGC"' in data:
-        text = data.decode("latin-1")
-        brace = text.find("{", text.find('"AIGC"') + len('"AIGC"'))
-        if brace != -1:
-            try:
-                _, end = json.JSONDecoder().raw_decode(text, brace)
-            except ValueError:
-                return None
-            return _parse(text[brace:end], require_tc260_field=True)
+    # Generic raw-JSON forms the PNG-chunk and XMP paths above both miss, each
+    # gated on a TC260 field: the ``"AIGC":{...}`` key wrapper (as written into
+    # JPEG EXIF UserComment) and the bare ``AIGC{...}`` blob (the label glued
+    # straight to its JSON, no key wrapper, in a JPEG APP segment near the JFIF
+    # header). `raw_decode` brace-matches the inner object (respecting nested
+    # braces / quoted strings); `_parse` applies the same dict coercion + TC260
+    # gate as the PNG-chunk path. A non-matching hit (no TC260 field, or an
+    # undecodable brace) must FALL THROUGH to the next form, never short-circuit:
+    # a quoted ``"AIGC"`` can appear later in an XMP packet while the real label
+    # is a bare ``AIGC{...}`` blob earlier in the file, so an unconditional return
+    # on the quoted form would shadow the bare form.
+    text = data.decode("latin-1")
+    for needle in ('"AIGC"', "AIGC{"):
+        start = text.find(needle)
+        if start == -1:
+            continue
+        # First brace at/after the needle: the object brace for ``"AIGC":{`` and
+        # the glued brace (at start+4) for the bare ``AIGC{`` -- one search covers both.
+        brace = text.find("{", start)
+        if brace == -1:
+            continue
+        try:
+            _, end = json.JSONDecoder().raw_decode(text, brace)
+        except ValueError:
+            continue
+        if result := _parse(text[brace:end], require_tc260_field=True):
+            return result
     return None
+
+
+# C2PA "Durable Content Credentials" manifest repositories (C2PA 2.4). When the
+# embedded manifest is stripped, an XMP ``dcterms:provenance`` URL can still point
+# at the vendor's cloud manifest store, from which the credentials are recoverable
+# server-side via the file's soft binding. Host -> vendor label. Verified on real
+# files: Adobe's Content Authenticity cloud store.
+_C2PA_MANIFEST_REPOSITORIES: tuple[tuple[bytes, str], ...] = (
+    (b"cai-manifests.adobe.com", "Adobe Content Authenticity"),
+)
+
+
+def c2pa_cloud_manifest_in(data: bytes) -> str | None:
+    """Return a C2PA cloud-manifest vendor label if ``data`` carries an XMP
+    ``dcterms:provenance`` pointer to a known manifest repository, else None.
+
+    The shared byte-scan (mirroring ``soft_binding_vendors_in``), so a caller that
+    already holds the scan head (``identify``) reuses it instead of re-reading.
+    """
+    if b"dcterms:provenance" not in data:
+        return None
+    for host, vendor in _C2PA_MANIFEST_REPOSITORIES:
+        if host in data:
+            return vendor
+    return None
+
+
+def c2pa_cloud_manifest(image_path: Path) -> str | None:
+    """Return a C2PA cloud-manifest vendor label if the file carries only an XMP
+    ``dcterms:provenance`` pointer to a manifest repository (C2PA 2.4 Durable
+    Content Credentials), else None.
+
+    This fires on the laundering case where the *embedded* manifest was stripped
+    but the XMP cloud reference survives, so the Content Credentials remain
+    recoverable server-side. It is provenance, NOT an AI assertion: the cloud
+    manifest can describe a human edit as easily as an AI generation, and reading
+    its contents needs a network fetch we do not do. ``identify`` surfaces it as a
+    provenance signal without setting ``is_ai_generated``.
+    """
+    return c2pa_cloud_manifest_in(scan_head(image_path, _QUICK_SCAN_BYTES))
 
 
 def huggingface_job(image_path: Path) -> str | None:
