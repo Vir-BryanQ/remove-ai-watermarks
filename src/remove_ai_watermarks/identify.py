@@ -45,6 +45,9 @@ from remove_ai_watermarks.noai.constants import C2PA_AI_TOOLS, C2PA_AI_VENDORS, 
 
 if TYPE_CHECKING:
     from pathlib import Path
+    from typing import Any
+
+    from numpy.typing import NDArray
 
     from remove_ai_watermarks.watermark_registry import MarkDetection
 
@@ -358,19 +361,21 @@ def _integrity_clashes(
     return clashes
 
 
-def _visible_sparkle(image_path: Path) -> float | None:
+def _visible_sparkle(image_path: Path, *, image: NDArray[Any] | None = None) -> float | None:
     """Visible Gemini-sparkle confidence in [0, 1], or None if unavailable.
 
     Optional: needs cv2/numpy (no GPU). The cv2 work lives in gemini_engine so
     this module stays dependency-light; returns None if cv2 or the engine
-    assets are missing, or the image can't be read.
+    assets are missing, or the image can't be read. ``image`` is a pre-decoded
+    BGR array shared across the visible-mark detectors (see ``identify``) so the
+    file is not decoded once per detector.
     """
     try:
         from remove_ai_watermarks.gemini_engine import detect_sparkle_confidence
     except Exception as exc:  # cv2/engine assets missing
         log.debug("visible-sparkle detector unavailable: %s", exc)
         return None
-    return detect_sparkle_confidence(image_path)
+    return detect_sparkle_confidence(image_path, image=image)
 
 
 # Visible text marks (registry keys) -> human-readable platform, mirroring the
@@ -384,14 +389,16 @@ _VISIBLE_MARK_PLATFORM = {
 }
 
 
-def _visible_text_marks(image_path: Path) -> list[MarkDetection]:
+def _visible_text_marks(image_path: Path, *, image: NDArray[Any] | None = None) -> list[MarkDetection]:
     """Detected visible Doubao/Jimeng marks (registry ``MarkDetection`` list).
 
     The Gemini sparkle keeps its own ``_visible_sparkle`` path (file-level
     confidence); these two text marks reuse the registry detectors, which apply
     each engine's calibrated NCC threshold via ``MarkDetection.detected``.
     Optional: needs cv2/numpy; returns ``[]`` if the engines/assets are missing
-    or the image can't be read.
+    or the image can't be read. ``image`` is a pre-decoded BGR array shared
+    across the visible-mark detectors (see ``identify``) so the file is not
+    decoded once per detector.
     """
     try:
         from remove_ai_watermarks.image_io import imread
@@ -399,7 +406,8 @@ def _visible_text_marks(image_path: Path) -> list[MarkDetection]:
     except Exception as exc:  # cv2/engine assets missing
         log.debug("visible-mark detectors unavailable: %s", exc)
         return []
-    image = imread(image_path)
+    if image is None:
+        image = imread(image_path)
     if image is None:
         return []
     detections: list[MarkDetection] = []
@@ -669,17 +677,32 @@ def identify(image_path: Path, *, check_visible: bool = True, check_invisible: b
         or xai_sig
     )
 
+    # Decode the file ONCE for every visible-mark detector. The sparkle and the
+    # text-mark detectors both consume a BGR array; letting each re-read the file
+    # was two full cv2 decodes of the same bitmap, which spikes memory on a small
+    # worker. None (cv2 missing / unreadable container) makes each detector fall
+    # back to its own read, preserving the old behavior.
+    vis_image: NDArray[Any] | None = None
+    if check_visible:
+        try:
+            from remove_ai_watermarks.image_io import imread
+
+            vis_image = imread(image_path)
+        except Exception as exc:  # cv2 missing - detectors fall back / no-op
+            log.debug("visible-mark decode unavailable: %s", exc)
+
     # ── Visible Gemini sparkle (fallback for stripped-metadata case) ─
-    if check_visible and (conf := _visible_sparkle(image_path)) is not None and conf >= _SPARKLE_THRESHOLD:
-        signals.append(Signal("visible_sparkle", f"NCC confidence {conf:.2f}", "medium"))
-        watermarks.append(f"Visible Gemini sparkle (confidence {conf:.2f})")
+    sparkle_conf = _visible_sparkle(image_path, image=vis_image) if check_visible else None
+    if sparkle_conf is not None and sparkle_conf >= _SPARKLE_THRESHOLD:
+        signals.append(Signal("visible_sparkle", f"NCC confidence {sparkle_conf:.2f}", "medium"))
+        watermarks.append(f"Visible Gemini sparkle (confidence {sparkle_conf:.2f})")
         if platform is None:
             platform = "Google Gemini family (visible sparkle detected)"
 
     # ── Visible Doubao / Jimeng text marks (registry; same stripped-metadata
     #    fallback role as the Gemini sparkle above) ─
     if check_visible:
-        for det in _visible_text_marks(image_path):
+        for det in _visible_text_marks(image_path, image=vis_image):
             signals.append(Signal(f"visible_{det.key}", f"NCC confidence {det.confidence:.2f}", "medium"))
             watermarks.append(f"Visible {det.label} (confidence {det.confidence:.2f})")
             if platform is None:

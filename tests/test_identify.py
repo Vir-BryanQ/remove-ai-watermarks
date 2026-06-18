@@ -434,6 +434,18 @@ class TestIdentifyVisibleTextMarks:
             r = identify(tmp_png_with_ai_metadata, check_visible=True)
         assert r.confidence == "high"
 
+    def test_visible_path_decodes_file_once(self, tmp_clean_png: Path):
+        """The web path identify(check_visible=True, check_invisible=False) must
+        decode the image exactly once and share the array across the sparkle +
+        text-mark detectors. Two decodes of the same bitmap spiked memory on the
+        small web worker (the OOM the decode-once refactor addresses)."""
+        import remove_ai_watermarks.image_io as image_io
+
+        real_imread = image_io.imread
+        with patch.object(image_io, "imread", side_effect=real_imread) as mock_imread:
+            identify(tmp_clean_png, check_visible=True, check_invisible=False)
+        assert mock_imread.call_count == 1
+
 
 # ── Caveats and serialization ───────────────────────────────────────
 
